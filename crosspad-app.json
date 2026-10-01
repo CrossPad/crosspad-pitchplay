@@ -1,0 +1,19 @@
+{
+  "name": "Pitch Play",
+  "id": "pitchplay",
+  "version": "0.1.0",
+  "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
+  "category": "music",
+  "icon": "pitchplay.png",
+  "component_path": "components/crosspad-pitchplay",
+  "platforms": [
+    "esp-idf"
+  ],
+  "requires": {
+    "crosspad-core": ">=1.38.0",
+    "crosspad-gui": ">=1.18.0"
+  },
+  "changelog": [
+    "0.1.0: an instrument from one sample or many, picked from a drop-down (saved instruments, the Recorder's takes, the whole card); the pads play it chromatically from a base note, OCT moves it, a MIDI keyboard plays it too; EDIT lists the zones -- add one from the card, remove one, set its root or leave it to detection; SAVE keeps it in /crosspad/pitchplay with its samples copied in; the engine is borrowed from the kits while the app is open (core 1.38 IInstrumentHost); requires core 1.38 and gui 1.18"
+  ]
+}
