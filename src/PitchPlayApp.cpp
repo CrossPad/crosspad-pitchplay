@@ -1229,7 +1229,7 @@ void prog_step_cb(lv_event_t* e)
         const int n = 7;   // MusicTheory wraps a degree into the scale itself
         st.degree = (uint8_t)((st.degree + n + d) % n);
     } else {
-        const int n = 12;  // the chord types, before Diatonic and Types
+        const int n = crosspad::MusicTheory::playableChordCount();
         st.chordType = (uint8_t)((st.chordType + n + d) % n);
     }
     prog_show();
