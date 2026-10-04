@@ -1,7 +1,7 @@
 {
   "name": "Pitch Play",
   "id": "pitchplay",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
   "category": "music",
   "icon": "pitchplay.png",
@@ -14,6 +14,7 @@
     "crosspad-gui": ">=1.18.0"
   },
   "changelog": [
+    "0.4.0: forty-six progressions through core 1.45 -- the thirty jazz, soul, lo-fi and trap ones included -- and picking one now brings its mode with it, so Backdoor arrives in Mixolydian and Lydian Dream in Lydian instead of being read as degrees of whatever was selected.",
     "0.3.1: the chord list follows core 1.44 -- ninth chords and eight R&B/soul progressions (Soul Turn, ii-V-I, Gospel, Deceptive, Minor Soul, Tritone, Neo-Soul, Soul Shuffle). The editor cycles chord types by MusicTheory::playableChordCount() rather than a literal twelve.",
     "0.3.0: the music comes from crosspad::MusicTheory instead of this file -- nine scales, fourteen chord types (Diatonic among them, which takes its quality from the degree) and eight progressions, none of which was reachable before because nothing linked it. SCALE picks key, scale, transpose and chord; \"Own progression\" edits up to eight progressions of your own, steps of (degree, chord), kept in NVS across a reboot and playing the moment they are saved. Requires core 1.42.",
     "0.2.0: key, scale, transpose and chords. The pads are sixteen degrees of a scale from a key (chromatic, major, minor, dorian, mixolydian, two pentatonics, blues, harmonic minor) shifted by a transpose of -12..+12; a pad can play a power chord, a triad, a 7th or an octave, built from the scale so it stays in key -- and from fixed intervals on chromatic, where two degrees is a whole tone. SCALE on the top row opens the window and carries the answer (\"C maj\"); a dot marks chords on.",

@@ -1159,8 +1159,23 @@ void scale_step_cb(lv_event_t* e)
         case 0: set_mapping(s_oct, (s_key + 12 + d) % 12, s_scale, s_transpose, s_chordIdx); break;
         case 1: set_mapping(s_oct, s_key, (s_scale + scales + d) % scales, s_transpose, s_chordIdx); break;
         case 2: set_mapping(s_oct, s_key, s_scale, s_transpose + d, s_chordIdx); break;
-        default: set_mapping(s_oct, s_key, s_scale, s_transpose,
-                             (s_chordIdx + chords + d) % chords); break;
+        default: {
+            /* A progression is degrees, so it is written in a mode: picking
+             * one brings its scale with it, or "Backdoor" would have no flat
+             * seventh to walk down and "Lydian Dream" no major II. The twelve
+             * chord types and the two modes leave the scale alone, and so do
+             * the player's own progressions -- nothing knows what key those
+             * were meant in. */
+            const int next = (s_chordIdx + chords + d) % chords;
+            const int first = crosspad::MusicTheory::CHORD_PROG_START_IDX;
+            const int builtins = (int)crosspad::MusicTheory::builtinProgCount();
+            int scale = s_scale;
+            if (next >= first && next < first + builtins) {
+                scale = (int)crosspad::MusicTheory::builtinProgScale((uint8_t)(next - first));
+            }
+            set_mapping(s_oct, s_key, scale, s_transpose, next);
+            break;
+        }
     }
 }
 
