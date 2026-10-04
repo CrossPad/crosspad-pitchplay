@@ -66,6 +66,20 @@ namespace {
 constexpr uint32_t kTickMs   = 50;
 constexpr uint8_t  kPads     = 16;
 constexpr int      kChordMax = 4;    ///< notes in the widest chord a pad makes
+
+/* This board boots with under 150 bytes of internal RAM to spare: the 64 kB
+ * DMA pool is reserved after the static data is placed, and the first build
+ * of this feature added 144 bytes of it and aborted in main_task with
+ * "Could not reserve internal/DMA pool (0x104)". Everything this file keeps
+ * per-pad or per-widget therefore lives in PSRAM. None of it is touched from
+ * an interrupt or with the cache off, which is the only thing that would
+ * forbid it. */
+#ifdef ESP_PLATFORM
+  #include "esp_attr.h"
+  #define PP_SLOW_BSS EXT_RAM_BSS_ATTR
+#else
+  #define PP_SLOW_BSS
+#endif
 constexpr int32_t  kRowH     = 26;
 constexpr uint32_t kPageRows = 40;
 constexpr uint8_t  kVolStep  = 5;
@@ -99,7 +113,7 @@ lv_obj_t* s_info = nullptr;
 lv_obj_t* s_range = nullptr;
 lv_obj_t* s_volBtn = nullptr;
 lv_obj_t* s_scaleBtn = nullptr;     ///< top row: the key and scale, in short
-lv_obj_t* s_scaleVal[4] = {};       ///< the window's four value labels
+PP_SLOW_BSS lv_obj_t* s_scaleVal[4];   ///< the window's four value labels
 lv_obj_t* s_cells[kPads] = {};
 lv_obj_t* s_overlay = nullptr;
 lv_obj_t* s_zoneList = nullptr;
@@ -138,8 +152,24 @@ int      s_zoneSel = 0;
 
 std::atomic<bool>     s_playable{false};
 std::atomic<uint32_t> s_lit{0};
-std::atomic<uint8_t>  s_padHeld[kPads][kChordMax];   ///< what a pad struck, for its release
-std::atomic<uint8_t>  s_padHeldN[kPads];
+/* What a pad struck, so its release stops those notes and not whatever the
+ * mapping says now: four 7-bit notes and a 3-bit count in one aligned word,
+ * which a single store publishes and a single load reads. */
+PP_SLOW_BSS uint32_t s_padHeld[kPads];
+constexpr uint32_t pack_chord(const uint8_t* n, int count)
+{
+    return (uint32_t)count | ((uint32_t)n[0] << 3) | ((uint32_t)n[1] << 10)
+         | ((uint32_t)n[2] << 17) | ((uint32_t)n[3] << 24);
+}
+inline int unpack_chord(uint32_t w, uint8_t* out)
+{
+    const int count = (int)(w & 7u);
+    out[0] = (uint8_t)((w >> 3) & 0x7F);
+    out[1] = (uint8_t)((w >> 10) & 0x7F);
+    out[2] = (uint8_t)((w >> 17) & 0x7F);
+    out[3] = (uint8_t)((w >> 24) & 0x7F);
+    return count > kChordMax ? kChordMax : count;
+}
 uint32_t s_drawnLit = 0xFFFFFFFFu;
 
 crosspad::IInstrumentHost* host() { return crosspad::getPlatformServices().instrumentHost; }
@@ -227,11 +257,11 @@ constexpr int kChordCount = 5;
 constexpr const char* kKeyName[12] = {"C", "C#", "D", "D#", "E", "F", "F#",
                                       "G", "G#", "A", "A#", "B"};
 
-int     s_scale = 0;              ///< index into kScales; 0 = chromatic, as before
-int     s_key = 0;                ///< pitch class of degree 0
-int     s_transpose = 0;          ///< semitones, -12..+12, on top of everything
-Chord   s_chord = Chord::Off;
-uint8_t s_padNotes[kPads] = {};   ///< what each pad sounds, rebuilt on every change
+PP_SLOW_BSS int     s_scale;        ///< index into kScales; 0 = chromatic, as before
+PP_SLOW_BSS int     s_key;          ///< pitch class of degree 0
+PP_SLOW_BSS int     s_transpose;    ///< semitones, -12..+12, on top of everything
+PP_SLOW_BSS Chord   s_chord;        ///< Chord::Off is zero, so a zeroed BSS is "off"
+PP_SLOW_BSS uint8_t s_padNotes[kPads];   ///< what each pad sounds, rebuilt on every change
 
 /// The note of scale degree @p d counted up from the key in s_base's octave.
 int degree_note(int d)
@@ -348,23 +378,20 @@ public:
         if (pad >= kPads) return;
         /* The chord is kept as it was struck, so a release still stops the
          * right notes after OCT, the key or the chord itself has moved. */
-        uint8_t notes[kChordMax];
+        uint8_t notes[kChordMax] = {};
         const int n = chord_of(pad, notes);
-        s_padHeldN[pad].store((uint8_t)n);
-        for (int i = 0; i < n; ++i) {
-            s_padHeld[pad][i].store(notes[i]);
-            play_one(notes[i], vel, pad);
-        }
+        s_padHeld[pad] = pack_chord(notes, n);
+        for (int i = 0; i < n; ++i) play_one(notes[i], vel, pad);
         light_on(pad, vel);
     }
     void onPadRelease(crosspad::PadManager& pm, uint8_t pad) override
     {
         if (pad >= kPads) return;
         auto* p = inst();
-        const int n = (int)s_padHeldN[pad].exchange(0);
-        for (int i = 0; i < n; ++i) {
-            if (p) p->noteOff(s_padHeld[pad][i].load());
-        }
+        uint8_t notes[kChordMax];
+        const int n = unpack_chord(s_padHeld[pad], notes);
+        s_padHeld[pad] = 0;
+        for (int i = 0; i < n; ++i) if (p) p->noteOff(notes[i]);
         light_off(pad);
         pm.notifyNoteOff(pad, true);
     }
@@ -1123,18 +1150,17 @@ void cell_cb(lv_event_t* e)
     const uint8_t pad = (uint8_t)(intptr_t)lv_event_get_user_data(e);
     if (pad >= kPads) return;
     if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
-        uint8_t notes[kChordMax];
+        uint8_t notes[kChordMax] = {};
         const int n = chord_of(pad, notes);
-        s_padHeldN[pad].store((uint8_t)n);
-        for (int i = 0; i < n; ++i) {
-            s_padHeld[pad][i].store(notes[i]);
-            play_one(notes[i], 100, pad);
-        }
+        s_padHeld[pad] = pack_chord(notes, n);
+        for (int i = 0; i < n; ++i) play_one(notes[i], 100, pad);
         light_on(pad, 100);
     } else {
         auto* p = inst();
-        const int n = (int)s_padHeldN[pad].exchange(0);
-        for (int i = 0; i < n; ++i) if (p) p->noteOff(s_padHeld[pad][i].load());
+        uint8_t notes[kChordMax];
+        const int n = unpack_chord(s_padHeld[pad], notes);
+        s_padHeld[pad] = 0;
+        for (int i = 0; i < n; ++i) if (p) p->noteOff(notes[i]);
         light_off(pad);
     }
 }
