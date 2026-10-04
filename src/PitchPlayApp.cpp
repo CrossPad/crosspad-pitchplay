@@ -65,6 +65,7 @@ namespace {
 
 constexpr uint32_t kTickMs   = 50;
 constexpr uint8_t  kPads     = 16;
+constexpr int      kChordMax = 4;    ///< notes in the widest chord a pad makes
 constexpr int32_t  kRowH     = 26;
 constexpr uint32_t kPageRows = 40;
 constexpr uint8_t  kVolStep  = 5;
@@ -84,7 +85,7 @@ constexpr size_t kZoneColors = sizeof(kZoneRgb) / sizeof(kZoneRgb[0]);
 
 enum class Wait : uint8_t { None, Load, Save };
 enum class Listing : uint8_t { None, Library, Takes };
-enum class Overlay : uint8_t { None, Edit, Browse, Name };
+enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale };
 enum class EntryKind : uint8_t { Instrument, Sample, Card };
 
 struct Entry {
@@ -97,6 +98,8 @@ lv_obj_t* s_dropdown = nullptr;
 lv_obj_t* s_info = nullptr;
 lv_obj_t* s_range = nullptr;
 lv_obj_t* s_volBtn = nullptr;
+lv_obj_t* s_scaleBtn = nullptr;     ///< top row: the key and scale, in short
+lv_obj_t* s_scaleVal[4] = {};       ///< the window's four value labels
 lv_obj_t* s_cells[kPads] = {};
 lv_obj_t* s_overlay = nullptr;
 lv_obj_t* s_zoneList = nullptr;
@@ -135,7 +138,8 @@ int      s_zoneSel = 0;
 
 std::atomic<bool>     s_playable{false};
 std::atomic<uint32_t> s_lit{0};
-std::atomic<uint8_t>  s_padNote[kPads];
+std::atomic<uint8_t>  s_padHeld[kPads][kChordMax];   ///< what a pad struck, for its release
+std::atomic<uint8_t>  s_padHeldN[kPads];
 uint32_t s_drawnLit = 0xFFFFFFFFu;
 
 crosspad::IInstrumentHost* host() { return crosspad::getPlatformServices().instrumentHost; }
@@ -180,21 +184,150 @@ int zone_for(int note)
     return best;
 }
 
-uint8_t pad_note(uint8_t pad) { return (uint8_t)std::min(127, s_base + pad); }
+// ── key, scale, transpose, chords ──────────────────────────────────────────
+
+/* The pads were sixteen semitones from s_base and nothing else. They are now
+ * sixteen *degrees* of a scale, from a key, shifted by a transpose, each
+ * optionally a chord. Chromatic is a scale like any other (twelve degrees),
+ * so there is one path, not two.
+ *
+ * s_padNotes is the whole mapping, rebuilt whenever any of it changes: the
+ * pad grid, the LEDs, the lighting and the chord builder all read it rather
+ * than recomputing, and a note coming back from a MIDI keyboard finds its pad
+ * by scanning it. With a scale the pads are no longer contiguous, so the old
+ * "note - s_base" arithmetic would have lit the wrong cell. */
+
+struct ScaleDef {
+    const char* name;
+    uint8_t     n;          ///< degrees per octave
+    uint8_t     step[7];    ///< semitone of each degree
+};
+
+constexpr ScaleDef kScales[] = {
+    {"Chromatic",  12, {0}},                     // n == 12: the degree is the semitone
+    {"Major",       7, {0, 2, 4, 5, 7, 9, 11}},
+    {"Minor",       7, {0, 2, 3, 5, 7, 8, 10}},
+    {"Dorian",      7, {0, 2, 3, 5, 7, 9, 10}},
+    {"Mixolydian",  7, {0, 2, 4, 5, 7, 9, 10}},
+    {"Penta maj",   5, {0, 2, 4, 7, 9}},
+    {"Penta min",   5, {0, 3, 5, 7, 10}},
+    {"Blues",       6, {0, 3, 5, 6, 7, 10}},
+    {"Harm minor",  7, {0, 2, 3, 5, 7, 8, 11}},
+};
+constexpr int kScaleCount = (int)(sizeof(kScales) / sizeof(kScales[0]));
+
+/* Off is one note. The rest are built from the scale where there is one --
+ * a triad is degrees d, d+2, d+4, so it stays in key and changes quality by
+ * itself -- and from fixed intervals on Chromatic, where "two degrees up" is
+ * a whole tone and would make no chord at all. */
+enum class Chord : uint8_t { Off, Power, Triad, Seventh, Octave };
+constexpr const char* kChordName[] = {"Off", "Power", "Triad", "7th", "Octave"};
+constexpr int kChordCount = 5;
+
+constexpr const char* kKeyName[12] = {"C", "C#", "D", "D#", "E", "F", "F#",
+                                      "G", "G#", "A", "A#", "B"};
+
+int     s_scale = 0;              ///< index into kScales; 0 = chromatic, as before
+int     s_key = 0;                ///< pitch class of degree 0
+int     s_transpose = 0;          ///< semitones, -12..+12, on top of everything
+Chord   s_chord = Chord::Off;
+uint8_t s_padNotes[kPads] = {};   ///< what each pad sounds, rebuilt on every change
+
+/// The note of scale degree @p d counted up from the key in s_base's octave.
+int degree_note(int d)
+{
+    const ScaleDef& sc = kScales[s_scale];
+    const int root = (s_base / 12) * 12 + s_key;
+    int n;
+    if (sc.n == 12) {
+        n = root + d;
+    } else {
+        const int oct = d / sc.n;
+        const int idx = d % sc.n;
+        n = root + oct * 12 + sc.step[idx];
+    }
+    n += s_transpose;
+    return n < 0 ? 0 : (n > 127 ? 127 : n);
+}
+
+void rebuild_pads()
+{
+    for (uint8_t pad = 0; pad < kPads; ++pad) s_padNotes[pad] = (uint8_t)degree_note(pad);
+}
+
+/// Which pad sounds @p note, or -1. Scans, because a scale leaves gaps.
+int pad_of_note(int note)
+{
+    for (uint8_t pad = 0; pad < kPads; ++pad) if (s_padNotes[pad] == note) return pad;
+    return -1;
+}
+
+/// The notes a press on @p pad makes, into @p out. Always at least one.
+int chord_of(uint8_t pad, uint8_t* out)
+{
+    const bool chromatic = kScales[s_scale].n == 12;
+    const int  root = degree_note(pad);
+    auto put = [&](int n, int i) { out[i] = (uint8_t)(n < 0 ? 0 : (n > 127 ? 127 : n)); };
+    switch (s_chord) {
+        case Chord::Off:
+            put(root, 0);
+            return 1;
+        case Chord::Power:
+            put(root, 0); put(root + 7, 1);
+            return 2;
+        case Chord::Octave:
+            put(root, 0); put(root + 12, 1);
+            return 2;
+        case Chord::Triad:
+            if (chromatic) { put(root, 0); put(root + 4, 1); put(root + 7, 2); }
+            else           { put(root, 0); put(degree_note(pad + 2), 1); put(degree_note(pad + 4), 2); }
+            return 3;
+        case Chord::Seventh:
+            if (chromatic) { put(root, 0); put(root + 4, 1); put(root + 7, 2); put(root + 10, 3); }
+            else           { put(root, 0); put(degree_note(pad + 2), 1);
+                             put(degree_note(pad + 4), 2); put(degree_note(pad + 6), 3); }
+            return 4;
+    }
+    put(root, 0);
+    return 1;
+}
+
+uint8_t pad_note(uint8_t pad) { return pad < kPads ? s_padNotes[pad] : 0; }
 
 // ── playing ────────────────────────────────────────────────────────────────
 
 /* A pad lights while its note sounds, from the pads, a touch or a keyboard:
  * with a pad logic active, PadManager leaves the LEDs to it. */
-void play(uint8_t note, uint8_t vel, uint8_t pad)
+/// One note, no lighting: what a chord is built from.
+void play_one(uint8_t note, uint8_t vel, uint8_t pad)
 {
     auto* p = inst();
     if (!p || !s_playable.load()) return;
     p->noteOn(note, vel ? vel : 1, pad);
-    if (note >= s_base && note < s_base + kPads) {
-        s_lit.fetch_or(1u << (note - s_base));
-        crosspad::getPadManager().notifyNoteOn(note - s_base, vel ? vel : 1, true);
-    }
+}
+
+void light_on(int pad, uint8_t vel)
+{
+    if (pad < 0) return;
+    s_lit.fetch_or(1u << pad);
+    crosspad::getPadManager().notifyNoteOn((uint8_t)pad, vel ? vel : 1, true);
+}
+
+void light_off(int pad)
+{
+    if (pad < 0) return;
+    s_lit.fetch_and(~(1u << pad));
+    crosspad::getPadManager().notifyNoteOff((uint8_t)pad, true);
+}
+
+/* A note from somewhere other than the pads -- a MIDI keyboard, a touch on a
+ * cell -- lights whichever pad sounds it, found in the table: with a scale
+ * the pads are not contiguous, so the old note-minus-base arithmetic pointed
+ * at the wrong cell as soon as the scale was anything but chromatic. */
+void play(uint8_t note, uint8_t vel, uint8_t pad)
+{
+    play_one(note, vel, pad);
+    light_on(pad_of_note(note), vel);
 }
 
 void stop(uint8_t note)
@@ -202,10 +335,7 @@ void stop(uint8_t note)
     auto* p = inst();
     if (!p) return;
     p->noteOff(note);
-    if (note >= s_base && note < s_base + kPads) {
-        s_lit.fetch_and(~(1u << (note - s_base)));
-        crosspad::getPadManager().notifyNoteOff(note - s_base, true);
-    }
+    light_off(pad_of_note(note));
 }
 
 /// The pads play the instrument and nothing else; the kits are not loaded.
@@ -216,15 +346,27 @@ public:
     void onPadPress(crosspad::PadManager&, uint8_t pad, uint8_t vel) override
     {
         if (pad >= kPads) return;
-        const uint8_t note = pad_note(pad);
-        s_padNote[pad].store(note);      // released as pressed, whatever OCT does meanwhile
-        play(note, vel, pad);
+        /* The chord is kept as it was struck, so a release still stops the
+         * right notes after OCT, the key or the chord itself has moved. */
+        uint8_t notes[kChordMax];
+        const int n = chord_of(pad, notes);
+        s_padHeldN[pad].store((uint8_t)n);
+        for (int i = 0; i < n; ++i) {
+            s_padHeld[pad][i].store(notes[i]);
+            play_one(notes[i], vel, pad);
+        }
+        light_on(pad, vel);
     }
     void onPadRelease(crosspad::PadManager& pm, uint8_t pad) override
     {
         if (pad >= kPads) return;
-        stop(s_padNote[pad].load());
-        pm.notifyNoteOff(pad, true);   // its note may have left the range with OCT
+        auto* p = inst();
+        const int n = (int)s_padHeldN[pad].exchange(0);
+        for (int i = 0; i < n; ++i) {
+            if (p) p->noteOff(s_padHeld[pad][i].load());
+        }
+        light_off(pad);
+        pm.notifyNoteOff(pad, true);
     }
     void onPadPressure(crosspad::PadManager&, uint8_t, uint8_t) override {}
 };
@@ -321,6 +463,8 @@ int number_step(lv_event_t* e)
 
 // ── showing ────────────────────────────────────────────────────────────────
 
+void show_scale_line();
+
 void show_pads()
 {
     char name[8];
@@ -334,12 +478,13 @@ void show_pads()
         lv_obj_set_style_border_color(c, z >= 0 ? lv_color_hex(kZoneRgb[z % kZoneColors]) : kPanel, 0);
     }
     if (s_range) {
-        char a[8], b[8], buf[24];
+        char a[8], b[8], buf[32];
         note_name(pad_note(0), a, sizeof(a));
         note_name(pad_note(kPads - 1), b, sizeof(b));
         std::snprintf(buf, sizeof(buf), "%s - %s", a, b);
         lv_label_set_text(s_range, buf);
     }
+    show_scale_line();
     s_drawnLit = 0xFFFFFFFFu;   // redrawn on the next tick
 }
 
@@ -523,6 +668,7 @@ void close_overlay()
     s_overlayGroup = nullptr;
     lv_obj_delete_async(s_overlay);
     s_overlay = s_zoneList = s_rootLabel = s_nameArea = nullptr;
+    for (auto& v : s_scaleVal) v = nullptr;   // children of the overlay, gone with it
     s_ov = Overlay::None;
 }
 
@@ -851,14 +997,29 @@ void back_cb(lv_event_t* e)
     if (app) app->destroyAppAsync();
 }
 
+/* Sixteen degrees of a scale span more than sixteen semitones, so the top
+ * pad -- not s_base + 15 -- is what has to stay a note. Tried on the real
+ * mapping and rolled back if it does not fit. */
+bool set_mapping(int base, int key, int scale, int transpose)
+{
+    const uint8_t wasB = s_base; const int wasK = s_key, wasS = s_scale, wasT = s_transpose;
+    s_base = (uint8_t)(base < 0 ? 0 : (base > 127 ? 127 : base));
+    s_key = key; s_scale = scale; s_transpose = transpose;
+    const int lo = degree_note(0), hi = degree_note(kPads - 1);
+    if (base < 0 || base > 127 || lo < 0 || hi > 127) {
+        s_base = wasB; s_key = wasK; s_scale = wasS; s_transpose = wasT;
+        return false;
+    }
+    rebuild_pads();
+    show_pads();          // which calls show_scale_line()
+    show_leds();
+    return true;
+}
+
 void oct_cb(lv_event_t* e)
 {
     const int step = (int)(intptr_t)lv_event_get_user_data(e);
-    const int base = (int)s_base + 12 * step;
-    if (base < 0 || base + kPads - 1 > 127) return;
-    s_base = (uint8_t)base;
-    show_pads();
-    show_leds();
+    set_mapping((int)s_base + 12 * step, s_key, s_scale, s_transpose);
 }
 
 void volume_cb(lv_event_t* e)
@@ -870,15 +1031,111 @@ void volume_cb(lv_event_t* e)
     show_volume();
 }
 
+/* The key, the scale, the transpose and the chord: four of the same row, a
+ * name on the left and -/value/+ on the right. A window rather than four more
+ * controls on the main screen -- the bottom row is already OCT, the range and
+ * VOL, and these are set once and then played, not reached for mid-phrase.
+ * The top-row button carries the answer at a glance ("C maj"). */
+
+void show_scale_line()
+{
+    if (s_scaleBtn) {
+        char buf[16];
+        /* Short enough for a 56 px button: the key, three letters of the
+         * scale, and a dot when a chord is on so the pads' sound is never a
+         * surprise. */
+        const char* sc = kScales[s_scale].name;
+        std::snprintf(buf, sizeof(buf), "%s %.3s%s", kKeyName[s_key], sc,
+                      s_chord == Chord::Off ? "" : ".");
+        lv_label_set_text(lv_obj_get_child(s_scaleBtn, 0), buf);
+    }
+    if (!s_scaleVal[0]) return;
+    char buf[16];
+    lv_label_set_text(s_scaleVal[0], kKeyName[s_key]);
+    lv_label_set_text(s_scaleVal[1], kScales[s_scale].name);
+    std::snprintf(buf, sizeof(buf), "%+d", s_transpose);
+    lv_label_set_text(s_scaleVal[2], buf);
+    lv_label_set_text(s_scaleVal[3], kChordName[(int)s_chord]);
+}
+
+/// -1 or +1 on one of the four, from the button's user data: (which << 1) | up.
+void scale_step_cb(lv_event_t* e)
+{
+    const int code = (int)(intptr_t)lv_event_get_user_data(e);
+    const int which = code >> 1;
+    const int d = (code & 1) ? 1 : -1;
+    switch (which) {
+        case 0: set_mapping(s_base, (s_key + 12 + d) % 12, s_scale, s_transpose); break;
+        case 1: set_mapping(s_base, s_key, (s_scale + kScaleCount + d) % kScaleCount, s_transpose); break;
+        case 2: {
+            const int t = s_transpose + d;
+            if (t >= -12 && t <= 12) set_mapping(s_base, s_key, s_scale, t);
+            break;
+        }
+        default:
+            s_chord = (Chord)(((int)s_chord + kChordCount + d) % kChordCount);
+            show_scale_line();
+            break;
+    }
+}
+
+lv_obj_t* scale_row(const char* name, int which)
+{
+    lv_obj_t* r = make_row(s_overlay, kRowH);
+    lv_obj_t* l = lv_label_create(r);
+    lv_obj_set_flex_grow(l, 1);
+    lv_label_set_text(l, name);
+    make_button(r, 30, LV_SYMBOL_MINUS, scale_step_cb, s_overlayGroup,
+                (void*)(intptr_t)(which << 1));
+    lv_obj_t* v = lv_label_create(r);
+    lv_obj_set_width(v, 86);
+    lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(v, kAccent, 0);
+    lv_label_set_text(v, "");
+    s_scaleVal[which] = v;
+    make_button(r, 30, LV_SYMBOL_PLUS, scale_step_cb, s_overlayGroup,
+                (void*)(intptr_t)((which << 1) | 1));
+    return r;
+}
+
+void scale_cb(lv_event_t*)
+{
+    open_overlay(Overlay::Scale);
+    overlay_header("Key, scale and chords");
+    scale_row("Key", 0);
+    scale_row("Scale", 1);
+    scale_row("Transpose", 2);
+    scale_row("Chord", 3);
+    lv_obj_t* note = lv_label_create(s_overlay);
+    lv_obj_set_width(note, LV_PCT(100));
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(note, kDim, 0);
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_10, 0);
+    lv_label_set_text(note,
+        "The pads are sixteen degrees of the scale from the key, shifted by "
+        "the transpose. A chord is built in the scale, so it stays in key.");
+    show_scale_line();
+}
+
 /// A touch on a pad's cell plays it, as the pad would.
 void cell_cb(lv_event_t* e)
 {
     const uint8_t pad = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+    if (pad >= kPads) return;
     if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
-        s_padNote[pad].store(pad_note(pad));
-        play(pad_note(pad), 100, pad);
+        uint8_t notes[kChordMax];
+        const int n = chord_of(pad, notes);
+        s_padHeldN[pad].store((uint8_t)n);
+        for (int i = 0; i < n; ++i) {
+            s_padHeld[pad][i].store(notes[i]);
+            play_one(notes[i], 100, pad);
+        }
+        light_on(pad, 100);
     } else {
-        stop(s_padNote[pad].load());
+        auto* p = inst();
+        const int n = (int)s_padHeldN[pad].exchange(0);
+        for (int i = 0; i < n; ++i) if (p) p->noteOff(s_padHeld[pad][i].load());
+        light_off(pad);
     }
 }
 
@@ -1032,8 +1289,11 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
         lv_obj_set_style_max_height(list, 180, 0);
     }
     if (g) lv_group_add_obj(g, s_dropdown);
+    s_scaleBtn = make_button(top, 56, "", scale_cb, g);
     make_button(top, 48, "EDIT", edit_cb, g);
     make_button(top, 48, "SAVE", save_cb, g);
+
+    rebuild_pads();
 
     // -- the pads, bottom left first --
     lv_obj_t* grid = lv_obj_create(s_root);
@@ -1161,7 +1421,8 @@ void PitchPlay_destroy(lv_obj_t* root)
     }
     s_prevEncGroup = nullptr;
 #endif
-    s_root = s_dropdown = s_info = s_range = s_volBtn = nullptr;
+    s_root = s_dropdown = s_info = s_range = s_volBtn = s_scaleBtn = nullptr;
+    for (auto& v : s_scaleVal) v = nullptr;
     for (auto& c : s_cells) c = nullptr;
     lv_obj_delete_async(root);
 }

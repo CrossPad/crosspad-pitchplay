@@ -1,7 +1,7 @@
 {
   "name": "Pitch Play",
   "id": "pitchplay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
   "category": "music",
   "icon": "pitchplay.png",
@@ -14,6 +14,7 @@
     "crosspad-gui": ">=1.18.0"
   },
   "changelog": [
+    "0.2.0: key, scale, transpose and chords. The pads are sixteen degrees of a scale from a key (chromatic, major, minor, dorian, mixolydian, two pentatonics, blues, harmonic minor) shifted by a transpose of -12..+12; a pad can play a power chord, a triad, a 7th or an octave, built from the scale so it stays in key -- and from fixed intervals on chromatic, where two degrees is a whole tone. SCALE on the top row opens the window and carries the answer (\"C maj\"); a dot marks chords on.",
     "0.1.0: an instrument from one sample or many, picked from a drop-down (saved instruments, the Recorder's takes, the whole card); the pads play it chromatically from a base note, OCT moves it, a MIDI keyboard plays it too; EDIT lists the zones -- add one from the card, remove one, set its root or leave it to detection; SAVE keeps it in /crosspad/pitchplay with its samples copied in; the engine is borrowed from the kits while the app is open (core 1.38 IInstrumentHost); requires core 1.38 and gui 1.18"
   ]
 }
