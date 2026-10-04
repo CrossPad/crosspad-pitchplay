@@ -196,11 +196,39 @@ std::string logical(const std::string& full)
     return full;
 }
 
+PP_SLOW_BSS int s_key;          ///< pitch class of the tonic, 0..11
+
+/* Two spellings of the same twelve. A progression written in Eb that reads
+ * "D#" on the pads is not a different sound, it is a different piece of
+ * paper -- and this list is full of flat keys (Db, Eb, Ab, Bb). The key
+ * decides: the six whose signatures carry flats get flats, the rest sharps.
+ * F is among them with its one flat, though F itself is natural. */
+constexpr const char* kSharpName[12] = {"C", "C#", "D", "D#", "E", "F", "F#",
+                                        "G", "G#", "A", "A#", "B"};
+constexpr const char* kFlatName[12]  = {"C", "Db", "D", "Eb", "E", "F", "Gb",
+                                        "G", "Ab", "A", "Bb", "B"};
+
+bool key_is_flat(int key)
+{
+    switch (key) {
+        case 1: case 3: case 5: case 6: case 8: case 10: return true;   // Db Eb F Gb Ab Bb
+        default: return false;
+    }
+}
+
+const char* pitch_name(int pitchClass, int key)
+{
+    const int pc = ((pitchClass % 12) + 12) % 12;
+    return key_is_flat(key) ? kFlatName[pc] : kSharpName[pc];
+}
+
+/// The key itself, spelled the way its own signature would.
+const char* key_name(int key) { return pitch_name(key, key); }
+
 void note_name(int note, char* buf, size_t n)
 {
-    static const char* kNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
     if (note < 0 || note > 127) { std::snprintf(buf, n, "--"); return; }
-    std::snprintf(buf, n, "%s%d", kNames[note % 12], note / 12 - 1);
+    std::snprintf(buf, n, "%s%d", pitch_name(note, s_key), note / 12 - 1);
 }
 
 /// The zone the engine picks for @p note: the nearest root, the lower on a tie.
@@ -241,7 +269,6 @@ int zone_for(int note)
 PP_SLOW_BSS crosspad::MusicTheory  s_mt;
 PP_SLOW_BSS crosspad::PlaySettings s_ps;
 
-PP_SLOW_BSS int s_key;          ///< pitch class of the tonic, 0..11
 PP_SLOW_BSS int s_oct;          ///< PlaySettings octave, -2..+4
 constexpr int kOctDefault = 1;  ///< MusicTheory's base is (3+oct)*12, so 1 puts pad 1 on C3,
                                 ///< where this app has always started
@@ -249,8 +276,6 @@ PP_SLOW_BSS int s_scale;        ///< index into MusicTheory's scales
 PP_SLOW_BSS int s_chordIdx;     ///< 0..11 a chord type, 12 Diatonic, 13 Types, 14+ a progression
 PP_SLOW_BSS int s_transpose;    ///< semitones, -12..+12, on top of all of it
 
-constexpr const char* kKeyName[12] = {"C", "C#", "D", "D#", "E", "F", "F#",
-                                      "G", "G#", "A", "A#", "B"};
 
 int clamp_note(int n) { return n < 0 ? 0 : (n > 127 ? 127 : n); }
 
@@ -370,8 +395,9 @@ void pad_chord_name(uint8_t pad, char* buf, size_t len)
     const int note = s_ps.padMidiMap[pad];
     const uint8_t q = s_ps.padChordTypeIdx[pad];
     const char qc = crosspad::MusicTheory::chordQualChar(q);
-    if (qc) std::snprintf(buf, len, "%s%c", kKeyName[note % 12], qc);
-    else    std::snprintf(buf, len, "%s", kKeyName[note % 12]);
+    const char* root = pitch_name(note, s_key);
+    if (qc && qc != ' ') std::snprintf(buf, len, "%s%c", root, qc);
+    else                 std::snprintf(buf, len, "%s", root);
 }
 
 /// True while a pad sounds more than its own note.
@@ -1133,13 +1159,13 @@ void show_scale_line()
          * scale, and a dot when a chord is on so the pads' sound is never a
          * surprise. */
         const char* sc = crosspad::MusicTheory::scaleName((uint8_t)s_scale);
-        std::snprintf(buf, sizeof(buf), "%s %.3s%s", kKeyName[s_key], sc ? sc : "?",
+        std::snprintf(buf, sizeof(buf), "%s %.3s%s", key_name(s_key), sc ? sc : "?",
                       pads_are_chords() ? "." : "");
         lv_label_set_text(lv_obj_get_child(s_scaleBtn, 0), buf);
     }
     if (!s_scaleVal[0]) return;
     char buf[16];
-    lv_label_set_text(s_scaleVal[0], kKeyName[s_key]);
+    lv_label_set_text(s_scaleVal[0], key_name(s_key));
     const char* sc = crosspad::MusicTheory::scaleName((uint8_t)s_scale);
     lv_label_set_text(s_scaleVal[1], sc ? sc : "?");
     std::snprintf(buf, sizeof(buf), "%+d", s_transpose);
