@@ -35,6 +35,10 @@
 #include "crosspad/event/IEventBus.hpp"
 #include "crosspad/instrument/IInstrumentHost.hpp"
 #include "crosspad/instrument/PitchedInstrument.hpp"
+#include "crosspad/music/MusicTheory.hpp"
+#ifdef ESP_PLATFORM
+  #include "nvs.h"
+#endif
 #include "crosspad/led/RgbColor.hpp"
 #include "crosspad/pad/IPadLogicHandler.hpp"
 #include "crosspad/pad/PadLedController.hpp"
@@ -99,7 +103,7 @@ constexpr size_t kZoneColors = sizeof(kZoneRgb) / sizeof(kZoneRgb[0]);
 
 enum class Wait : uint8_t { None, Load, Save };
 enum class Listing : uint8_t { None, Library, Takes };
-enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale };
+enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale, Prog };
 enum class EntryKind : uint8_t { Instrument, Sample, Card };
 
 struct Entry {
@@ -114,6 +118,8 @@ lv_obj_t* s_range = nullptr;
 lv_obj_t* s_volBtn = nullptr;
 lv_obj_t* s_scaleBtn = nullptr;     ///< top row: the key and scale, in short
 PP_SLOW_BSS lv_obj_t* s_scaleVal[4];   ///< the window's four value labels
+PP_SLOW_BSS lv_obj_t* s_progChip[8];    ///< the progression editor's step chips
+PP_SLOW_BSS lv_obj_t* s_progVal[2];     ///< its degree and chord values
 lv_obj_t* s_cells[kPads] = {};
 lv_obj_t* s_overlay = nullptr;
 lv_obj_t* s_zoneList = nullptr;
@@ -129,7 +135,6 @@ crosspad::SubscriptionHandle s_noteOffSub = nullptr;
 /* Kept while the board runs: the app opens on what it last played. */
 crosspad::KitInfo s_spec;
 bool    s_haveSpec = false;
-uint8_t s_base = 48;           // the note of pad 1, C3
 uint8_t s_volume = 80;         // every pad's level, 0..100: zones peak at -1 dBFS, a chord needs room
 bool    s_followRoot = false;  // a sample just picked: its root goes to the middle of the pads
 
@@ -214,115 +219,166 @@ int zone_for(int note)
     return best;
 }
 
-// ── key, scale, transpose, chords ──────────────────────────────────────────
+// ── key, scale, chords and progressions ───────────────────────────────────
 
-/* The pads were sixteen semitones from s_base and nothing else. They are now
- * sixteen *degrees* of a scale, from a key, shifted by a transpose, each
- * optionally a chord. Chromatic is a scale like any other (twelve degrees),
- * so there is one path, not two.
+/* All of this is crosspad::MusicTheory's: nine scales, fourteen chord types
+ * (Diatonic among them, which takes its quality from the degree), eight
+ * progressions and room for eight more of the player's own. It was in core
+ * all along with nothing wired to it -- the linker was dropping the whole
+ * translation unit. This app is the first thing to ask for it, so the
+ * mapping, the chord voicings and the degree-to-quality tables are not
+ * repeated here.
  *
- * s_padNotes is the whole mapping, rebuilt whenever any of it changes: the
- * pad grid, the LEDs, the lighting and the chord builder all read it rather
- * than recomputing, and a note coming back from a MIDI keyboard finds its pad
- * by scanning it. With a scale the pads are no longer contiguous, so the old
- * "note - s_base" arithmetic would have lit the wrong cell. */
+ * PlaySettings is the answer: sixteen pads' notes and chord notes,
+ * recomputed by rebuildPadMap() whenever the key, octave, scale or chord
+ * changes. Transpose is ours, applied on top of what it returns -- a
+ * semitone shift of everything, which is what a singer asks for, and not the
+ * same gesture as changing the key.
+ *
+ * In PSRAM, all of it: PlaySettings is ~150 bytes and the custom
+ * progressions another ~400, and this board aborts at boot over 144. */
 
-struct ScaleDef {
-    const char* name;
-    uint8_t     n;          ///< degrees per octave
-    uint8_t     step[7];    ///< semitone of each degree
-};
+PP_SLOW_BSS crosspad::MusicTheory  s_mt;
+PP_SLOW_BSS crosspad::PlaySettings s_ps;
 
-constexpr ScaleDef kScales[] = {
-    {"Chromatic",  12, {0}},                     // n == 12: the degree is the semitone
-    {"Major",       7, {0, 2, 4, 5, 7, 9, 11}},
-    {"Minor",       7, {0, 2, 3, 5, 7, 8, 10}},
-    {"Dorian",      7, {0, 2, 3, 5, 7, 9, 10}},
-    {"Mixolydian",  7, {0, 2, 4, 5, 7, 9, 10}},
-    {"Penta maj",   5, {0, 2, 4, 7, 9}},
-    {"Penta min",   5, {0, 3, 5, 7, 10}},
-    {"Blues",       6, {0, 3, 5, 6, 7, 10}},
-    {"Harm minor",  7, {0, 2, 3, 5, 7, 8, 11}},
-};
-constexpr int kScaleCount = (int)(sizeof(kScales) / sizeof(kScales[0]));
-
-/* Off is one note. The rest are built from the scale where there is one --
- * a triad is degrees d, d+2, d+4, so it stays in key and changes quality by
- * itself -- and from fixed intervals on Chromatic, where "two degrees up" is
- * a whole tone and would make no chord at all. */
-enum class Chord : uint8_t { Off, Power, Triad, Seventh, Octave };
-constexpr const char* kChordName[] = {"Off", "Power", "Triad", "7th", "Octave"};
-constexpr int kChordCount = 5;
+PP_SLOW_BSS int s_key;          ///< pitch class of the tonic, 0..11
+PP_SLOW_BSS int s_oct;          ///< PlaySettings octave, -2..+4
+constexpr int kOctDefault = 1;  ///< MusicTheory's base is (3+oct)*12, so 1 puts pad 1 on C3,
+                                ///< where this app has always started
+PP_SLOW_BSS int s_scale;        ///< index into MusicTheory's scales
+PP_SLOW_BSS int s_chordIdx;     ///< 0..11 a chord type, 12 Diatonic, 13 Types, 14+ a progression
+PP_SLOW_BSS int s_transpose;    ///< semitones, -12..+12, on top of all of it
 
 constexpr const char* kKeyName[12] = {"C", "C#", "D", "D#", "E", "F", "F#",
                                       "G", "G#", "A", "A#", "B"};
 
-PP_SLOW_BSS int     s_scale;        ///< index into kScales; 0 = chromatic, as before
-PP_SLOW_BSS int     s_key;          ///< pitch class of degree 0
-PP_SLOW_BSS int     s_transpose;    ///< semitones, -12..+12, on top of everything
-PP_SLOW_BSS Chord   s_chord;        ///< Chord::Off is zero, so a zeroed BSS is "off"
-PP_SLOW_BSS uint8_t s_padNotes[kPads];   ///< what each pad sounds, rebuilt on every change
-
-/// The note of scale degree @p d counted up from the key in s_base's octave.
-int degree_note(int d)
-{
-    const ScaleDef& sc = kScales[s_scale];
-    const int root = (s_base / 12) * 12 + s_key;
-    int n;
-    if (sc.n == 12) {
-        n = root + d;
-    } else {
-        const int oct = d / sc.n;
-        const int idx = d % sc.n;
-        n = root + oct * 12 + sc.step[idx];
-    }
-    n += s_transpose;
-    return n < 0 ? 0 : (n > 127 ? 127 : n);
-}
+int clamp_note(int n) { return n < 0 ? 0 : (n > 127 ? 127 : n); }
 
 void rebuild_pads()
 {
-    for (uint8_t pad = 0; pad < kPads; ++pad) s_padNotes[pad] = (uint8_t)degree_note(pad);
+    s_ps.rootNote   = (uint8_t)s_key;
+    s_ps.octave     = (int8_t)s_oct;
+    s_ps.scaleIndex = (uint8_t)s_scale;
+    s_ps.chordIndex = (uint8_t)s_chordIdx;
+    s_mt.rebuildPadMap(s_ps);
+    if (s_transpose == 0) return;
+    for (int pad = 0; pad < kPads; ++pad) {
+        s_ps.padMidiMap[pad] = (uint8_t)clamp_note(s_ps.padMidiMap[pad] + s_transpose);
+        for (int c = 0; c < 6; ++c) {
+            if (s_ps.padChordNotes[pad][c] == 0xFF) continue;
+            s_ps.padChordNotes[pad][c] =
+                (uint8_t)clamp_note(s_ps.padChordNotes[pad][c] + s_transpose);
+        }
+    }
 }
 
-/// Which pad sounds @p note, or -1. Scans, because a scale leaves gaps.
+/// Which pad sounds @p note, or -1. Scans: a scale leaves gaps.
 int pad_of_note(int note)
 {
-    for (uint8_t pad = 0; pad < kPads; ++pad) if (s_padNotes[pad] == note) return pad;
+    for (uint8_t pad = 0; pad < kPads; ++pad) if (s_ps.padMidiMap[pad] == note) return pad;
     return -1;
 }
 
 /// The notes a press on @p pad makes, into @p out. Always at least one.
 int chord_of(uint8_t pad, uint8_t* out)
 {
-    const bool chromatic = kScales[s_scale].n == 12;
-    const int  root = degree_note(pad);
-    auto put = [&](int n, int i) { out[i] = (uint8_t)(n < 0 ? 0 : (n > 127 ? 127 : n)); };
-    switch (s_chord) {
-        case Chord::Off:
-            put(root, 0);
-            return 1;
-        case Chord::Power:
-            put(root, 0); put(root + 7, 1);
-            return 2;
-        case Chord::Octave:
-            put(root, 0); put(root + 12, 1);
-            return 2;
-        case Chord::Triad:
-            if (chromatic) { put(root, 0); put(root + 4, 1); put(root + 7, 2); }
-            else           { put(root, 0); put(degree_note(pad + 2), 1); put(degree_note(pad + 4), 2); }
-            return 3;
-        case Chord::Seventh:
-            if (chromatic) { put(root, 0); put(root + 4, 1); put(root + 7, 2); put(root + 10, 3); }
-            else           { put(root, 0); put(degree_note(pad + 2), 1);
-                             put(degree_note(pad + 4), 2); put(degree_note(pad + 6), 3); }
-            return 4;
+    if (pad >= kPads) { out[0] = 0; return 1; }
+    int n = 0;
+    const int have = s_ps.padChordCount[pad];
+    for (int c = 0; c < have && c < 6 && n < kChordMax; ++c) {
+        const uint8_t note = s_ps.padChordNotes[pad][c];
+        if (note != 0xFF) out[n++] = note;
     }
-    put(root, 0);
-    return 1;
+    if (n == 0) out[n++] = s_ps.padMidiMap[pad];
+    return n;
 }
 
-uint8_t pad_note(uint8_t pad) { return pad < kPads ? s_padNotes[pad] : 0; }
+/* The player's own progressions.
+ *
+ * MusicTheory holds up to eight and plays them, but it has no way to read
+ * one back, so this keeps the copies: they are what the editor edits, what
+ * NVS stores and what is handed back to MusicTheory on every start. A
+ * progression is steps of (degree, chord type) -- degrees of whatever scale
+ * is current, so the same progression follows a key or a mode change. */
+
+constexpr int kMaxCustom = crosspad::MusicTheory::MAX_CUSTOM_PROGS;
+constexpr int kMaxSteps  = 8;      ///< of MusicTheory's sixteen; eight fits the screen
+
+struct CustomProgression {
+    char              name[12];
+    crosspad::ProgStep steps[kMaxSteps];
+    uint8_t           count;
+};
+
+PP_SLOW_BSS CustomProgression s_custom[kMaxCustom];
+PP_SLOW_BSS int s_customN;
+PP_SLOW_BSS int s_editSlot;        ///< which of them the editor is on
+PP_SLOW_BSS int s_editSel;         ///< which step is being changed
+PP_SLOW_BSS CustomProgression s_edit;   ///< the working copy, so Back discards
+
+constexpr const char* kNvsNs  = "pitchplay";
+constexpr const char* kNvsKey = "progs";
+
+/// Hand every stored progression back to MusicTheory, in slot order.
+void register_customs()
+{
+    s_mt.clearCustomProgressions();
+    for (int i = 0; i < s_customN; ++i) {
+        s_mt.addCustomProgression(s_custom[i].name, s_custom[i].steps, s_custom[i].count);
+    }
+}
+
+/// The chord index that plays custom progression @p slot.
+int custom_chord_index(int slot)
+{
+    return crosspad::MusicTheory::CHORD_PROG_START_IDX
+         + (int)crosspad::MusicTheory::builtinProgCount() + slot;
+}
+
+void save_customs()
+{
+#ifdef ESP_PLATFORM
+    nvs_handle_t h;
+    if (nvs_open(kNvsNs, NVS_READWRITE, &h) != ESP_OK) return;
+    const uint8_t n = (uint8_t)s_customN;
+    nvs_set_u8(h, "n", n);
+    if (n) nvs_set_blob(h, kNvsKey, s_custom, sizeof(CustomProgression) * n);
+    nvs_commit(h);
+    nvs_close(h);
+#endif
+}
+
+void load_customs()
+{
+#ifdef ESP_PLATFORM
+    nvs_handle_t h;
+    if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t n = 0;
+    if (nvs_get_u8(h, "n", &n) == ESP_OK && n > 0 && n <= kMaxCustom) {
+        size_t len = sizeof(CustomProgression) * n;
+        if (nvs_get_blob(h, kNvsKey, s_custom, &len) == ESP_OK) s_customN = n;
+    }
+    nvs_close(h);
+#endif
+    register_customs();
+}
+
+/// "C", "Am", "G7" -- the pad's root and the quality its chord was built with.
+void pad_chord_name(uint8_t pad, char* buf, size_t len)
+{
+    if (pad >= kPads) { std::snprintf(buf, len, "--"); return; }
+    const int note = s_ps.padMidiMap[pad];
+    const uint8_t q = s_ps.padChordTypeIdx[pad];
+    const char qc = crosspad::MusicTheory::chordQualChar(q);
+    if (qc) std::snprintf(buf, len, "%s%c", kKeyName[note % 12], qc);
+    else    std::snprintf(buf, len, "%s", kKeyName[note % 12]);
+}
+
+/// True while a pad sounds more than its own note.
+bool pads_are_chords() { return s_ps.padChordCount[0] > 1; }
+
+
+uint8_t pad_note(uint8_t pad) { return pad < kPads ? s_ps.padMidiMap[pad] : 0; }
 
 // ── playing ────────────────────────────────────────────────────────────────
 
@@ -499,7 +555,8 @@ void show_pads()
         lv_obj_t* c = s_cells[pad];
         if (!c) continue;
         const int note = pad_note(pad);
-        note_name(note, name, sizeof(name));
+        if (pads_are_chords()) pad_chord_name(pad, name, sizeof(name));
+        else                   note_name(note, name, sizeof(name));
         lv_label_set_text(lv_obj_get_child(c, 0), name);
         const int z = s_haveSpec ? zone_for(note) : -1;
         lv_obj_set_style_border_color(c, z >= 0 ? lv_color_hex(kZoneRgb[z % kZoneColors]) : kPanel, 0);
@@ -696,6 +753,8 @@ void close_overlay()
     lv_obj_delete_async(s_overlay);
     s_overlay = s_zoneList = s_rootLabel = s_nameArea = nullptr;
     for (auto& v : s_scaleVal) v = nullptr;   // children of the overlay, gone with it
+    for (auto& c : s_progChip) c = nullptr;
+    for (auto& v : s_progVal) v = nullptr;
     s_ov = Overlay::None;
 }
 
@@ -1025,19 +1084,21 @@ void back_cb(lv_event_t* e)
 }
 
 /* Sixteen degrees of a scale span more than sixteen semitones, so the top
- * pad -- not s_base + 15 -- is what has to stay a note. Tried on the real
- * mapping and rolled back if it does not fit. */
-bool set_mapping(int base, int key, int scale, int transpose)
+ * pad is what has to stay a note, so the setting is tried on the real map
+ * and rolled back when the top of it has been clamped away. */
+bool set_mapping(int oct, int key, int scale, int transpose, int chordIdx)
 {
-    const uint8_t wasB = s_base; const int wasK = s_key, wasS = s_scale, wasT = s_transpose;
-    s_base = (uint8_t)(base < 0 ? 0 : (base > 127 ? 127 : base));
-    s_key = key; s_scale = scale; s_transpose = transpose;
-    const int lo = degree_note(0), hi = degree_note(kPads - 1);
-    if (base < 0 || base > 127 || lo < 0 || hi > 127) {
-        s_base = wasB; s_key = wasK; s_scale = wasS; s_transpose = wasT;
+    const int wasO = s_oct, wasK = s_key, wasS = s_scale, wasT = s_transpose, wasC = s_chordIdx;
+    if (oct < -2 || oct > 4 || transpose < -12 || transpose > 12) return false;
+    s_oct = oct; s_key = key; s_scale = scale; s_transpose = transpose; s_chordIdx = chordIdx;
+    rebuild_pads();
+    /* The map is clamped to 0..127, so a setting that runs off the top shows
+     * as the last pads landing on the same note. Refuse it and go back. */
+    if (s_ps.padMidiMap[kPads - 1] == s_ps.padMidiMap[kPads - 2]) {
+        s_oct = wasO; s_key = wasK; s_scale = wasS; s_transpose = wasT; s_chordIdx = wasC;
+        rebuild_pads();
         return false;
     }
-    rebuild_pads();
     show_pads();          // which calls show_scale_line()
     show_leds();
     return true;
@@ -1046,7 +1107,7 @@ bool set_mapping(int base, int key, int scale, int transpose)
 void oct_cb(lv_event_t* e)
 {
     const int step = (int)(intptr_t)lv_event_get_user_data(e);
-    set_mapping((int)s_base + 12 * step, s_key, s_scale, s_transpose);
+    set_mapping(s_oct + step, s_key, s_scale, s_transpose, s_chordIdx);
 }
 
 void volume_cb(lv_event_t* e)
@@ -1071,18 +1132,19 @@ void show_scale_line()
         /* Short enough for a 56 px button: the key, three letters of the
          * scale, and a dot when a chord is on so the pads' sound is never a
          * surprise. */
-        const char* sc = kScales[s_scale].name;
-        std::snprintf(buf, sizeof(buf), "%s %.3s%s", kKeyName[s_key], sc,
-                      s_chord == Chord::Off ? "" : ".");
+        const char* sc = crosspad::MusicTheory::scaleName((uint8_t)s_scale);
+        std::snprintf(buf, sizeof(buf), "%s %.3s%s", kKeyName[s_key], sc ? sc : "?",
+                      pads_are_chords() ? "." : "");
         lv_label_set_text(lv_obj_get_child(s_scaleBtn, 0), buf);
     }
     if (!s_scaleVal[0]) return;
     char buf[16];
     lv_label_set_text(s_scaleVal[0], kKeyName[s_key]);
-    lv_label_set_text(s_scaleVal[1], kScales[s_scale].name);
+    const char* sc = crosspad::MusicTheory::scaleName((uint8_t)s_scale);
+    lv_label_set_text(s_scaleVal[1], sc ? sc : "?");
     std::snprintf(buf, sizeof(buf), "%+d", s_transpose);
     lv_label_set_text(s_scaleVal[2], buf);
-    lv_label_set_text(s_scaleVal[3], kChordName[(int)s_chord]);
+    lv_label_set_text(s_scaleVal[3], s_mt.chordName((uint8_t)s_chordIdx));
 }
 
 /// -1 or +1 on one of the four, from the button's user data: (which << 1) | up.
@@ -1091,18 +1153,14 @@ void scale_step_cb(lv_event_t* e)
     const int code = (int)(intptr_t)lv_event_get_user_data(e);
     const int which = code >> 1;
     const int d = (code & 1) ? 1 : -1;
+    const int scales = (int)crosspad::MusicTheory::scaleCount();
+    const int chords = (int)s_mt.totalChordCount();
     switch (which) {
-        case 0: set_mapping(s_base, (s_key + 12 + d) % 12, s_scale, s_transpose); break;
-        case 1: set_mapping(s_base, s_key, (s_scale + kScaleCount + d) % kScaleCount, s_transpose); break;
-        case 2: {
-            const int t = s_transpose + d;
-            if (t >= -12 && t <= 12) set_mapping(s_base, s_key, s_scale, t);
-            break;
-        }
-        default:
-            s_chord = (Chord)(((int)s_chord + kChordCount + d) % kChordCount);
-            show_scale_line();
-            break;
+        case 0: set_mapping(s_oct, (s_key + 12 + d) % 12, s_scale, s_transpose, s_chordIdx); break;
+        case 1: set_mapping(s_oct, s_key, (s_scale + scales + d) % scales, s_transpose, s_chordIdx); break;
+        case 2: set_mapping(s_oct, s_key, s_scale, s_transpose + d, s_chordIdx); break;
+        default: set_mapping(s_oct, s_key, s_scale, s_transpose,
+                             (s_chordIdx + chords + d) % chords); break;
     }
 }
 
@@ -1125,6 +1183,168 @@ lv_obj_t* scale_row(const char* name, int which)
     return r;
 }
 
+/* The editor. One row of chips -- the steps -- then the two things a step
+ * is: its degree of the scale and the chord built on it. Eight steps fit the
+ * row; MusicTheory would take sixteen. */
+
+void prog_show()
+{
+    for (int i = 0; i < kMaxSteps; ++i) {
+        if (!s_progChip[i]) continue;
+        const bool used = i < s_edit.count;
+        lv_obj_set_style_bg_color(s_progChip[i], i == s_editSel ? kAccent : kPanel, 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(s_progChip[i], 0),
+                                    i == s_editSel ? kInk : (used ? kText : kDim), 0);
+        char b[8];
+        if (used) {
+            const char qc = crosspad::MusicTheory::chordQualChar(s_edit.steps[i].chordType);
+            std::snprintf(b, sizeof(b), "%d%c", s_edit.steps[i].degree + 1, qc ? qc : ' ');
+        } else {
+            std::snprintf(b, sizeof(b), "-");
+        }
+        lv_label_set_text(lv_obj_get_child(s_progChip[i], 0), b);
+    }
+    if (!s_progVal[0]) return;
+    char b[16];
+    std::snprintf(b, sizeof(b), "%d", s_edit.steps[s_editSel].degree + 1);
+    lv_label_set_text(s_progVal[0], b);
+    lv_label_set_text(s_progVal[1], s_mt.chordShortName(s_edit.steps[s_editSel].chordType));
+}
+
+void prog_chip_cb(lv_event_t* e)
+{
+    const int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < s_edit.count) { s_editSel = i; prog_show(); }
+}
+
+/// (which << 1) | up, as in the scale window: 0 the degree, 1 the chord.
+void prog_step_cb(lv_event_t* e)
+{
+    const int code = (int)(intptr_t)lv_event_get_user_data(e);
+    const int d = (code & 1) ? 1 : -1;
+    auto& st = s_edit.steps[s_editSel];
+    if ((code >> 1) == 0) {
+        /* Degrees of the scale that is current: a seven-note scale has
+         * seven, a pentatonic five. */
+        const int n = 7;   // MusicTheory wraps a degree into the scale itself
+        st.degree = (uint8_t)((st.degree + n + d) % n);
+    } else {
+        const int n = 12;  // the chord types, before Diatonic and Types
+        st.chordType = (uint8_t)((st.chordType + n + d) % n);
+    }
+    prog_show();
+}
+
+void prog_add_cb(lv_event_t*)
+{
+    if (s_edit.count >= kMaxSteps) return;
+    s_edit.steps[s_edit.count] = s_edit.steps[s_edit.count ? s_edit.count - 1 : 0];
+    s_editSel = s_edit.count;
+    ++s_edit.count;
+    prog_show();
+}
+
+void prog_del_cb(lv_event_t*)
+{
+    if (s_edit.count <= 1) return;
+    --s_edit.count;
+    if (s_editSel >= s_edit.count) s_editSel = s_edit.count - 1;
+    prog_show();
+}
+
+void prog_save_cb(lv_event_t*)
+{
+    const int slot = s_editSlot >= 0 && s_editSlot < kMaxCustom ? s_editSlot : s_customN;
+    if (slot >= kMaxCustom) { show_info("No room for another progression."); return; }
+    /* (slot & 7) rather than slot + 1: kMaxCustom is 8, and masking is what
+     * lets the compiler see the number is one digit. */
+    std::snprintf(s_edit.name, sizeof(s_edit.name), "Mine %d", (slot & 7) + 1);
+    s_custom[slot] = s_edit;
+    if (slot == s_customN) ++s_customN;
+    register_customs();
+    save_customs();
+    close_overlay();
+    /* Play it at once -- that is what the player came here for. */
+    set_mapping(s_oct, s_key, s_scale, s_transpose, custom_chord_index(slot));
+}
+
+lv_obj_t* prog_value_row(const char* name, int which)
+{
+    lv_obj_t* r = make_row(s_overlay, kRowH);
+    lv_obj_t* l = lv_label_create(r);
+    lv_obj_set_flex_grow(l, 1);
+    lv_label_set_text(l, name);
+    make_button(r, 30, LV_SYMBOL_MINUS, prog_step_cb, s_overlayGroup, (void*)(intptr_t)(which << 1));
+    lv_obj_t* v = lv_label_create(r);
+    lv_obj_set_width(v, 70);
+    lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(v, kAccent, 0);
+    lv_label_set_text(v, "");
+    s_progVal[which] = v;
+    make_button(r, 30, LV_SYMBOL_PLUS, prog_step_cb, s_overlayGroup, (void*)(intptr_t)((which << 1) | 1));
+    return r;
+}
+
+/// @p slot < 0 starts a new one, otherwise edits that stored progression.
+void prog_open(int slot)
+{
+    s_editSlot = slot;
+    if (slot >= 0 && slot < s_customN) {
+        s_edit = s_custom[slot];
+    } else {
+        /* I - V - vi - IV to start from: the one everybody already knows. */
+        s_edit.count = 4;
+        s_edit.steps[0] = {0, 1};
+        s_edit.steps[1] = {4, 1};
+        s_edit.steps[2] = {5, 2};
+        s_edit.steps[3] = {3, 1};
+    }
+    s_editSel = 0;
+
+    open_overlay(Overlay::Prog);
+    overlay_header(slot >= 0 ? "Edit progression" : "New progression");
+
+    lv_obj_t* chips = make_row(s_overlay, kRowH);
+    lv_obj_set_style_pad_column(chips, 3, 0);
+    for (int i = 0; i < kMaxSteps; ++i) {
+        lv_obj_t* b = make_button(chips, 0, "-", prog_chip_cb, s_overlayGroup, (void*)(intptr_t)i);
+        lv_obj_set_flex_grow(b, 1);
+        s_progChip[i] = b;
+    }
+
+    prog_value_row("Degree", 0);
+    prog_value_row("Chord", 1);
+
+    lv_obj_t* tools = make_row(s_overlay, kRowH);
+    make_button(tools, 56, "+ STEP", prog_add_cb, s_overlayGroup);
+    make_button(tools, 56, "- STEP", prog_del_cb, s_overlayGroup);
+    lv_obj_t* gap = lv_obj_create(tools);
+    lv_obj_remove_style_all(gap);
+    lv_obj_set_flex_grow(gap, 1);
+    make_button(tools, 56, "SAVE", prog_save_cb, s_overlayGroup);
+
+    lv_obj_t* note = lv_label_create(s_overlay);
+    lv_obj_set_width(note, LV_PCT(100));
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(note, kDim, 0);
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_10, 0);
+    lv_label_set_text(note,
+        "Steps are degrees of the scale, so the progression follows the key "
+        "and the mode. The pads play it over and over, an octave higher each "
+        "time round.");
+    prog_show();
+}
+
+void prog_new_cb(lv_event_t*)
+{
+    /* Editing the one that is playing, if it is one of ours; otherwise a new
+     * one from I - V - vi - IV. */
+    const int first = custom_chord_index(0);
+    const int slot = (s_chordIdx >= first && s_chordIdx < first + s_customN)
+                   ? s_chordIdx - first : -1;
+    prog_open(slot);
+}
+
 void scale_cb(lv_event_t*)
 {
     open_overlay(Overlay::Scale);
@@ -1133,6 +1353,13 @@ void scale_cb(lv_event_t*)
     scale_row("Scale", 1);
     scale_row("Transpose", 2);
     scale_row("Chord", 3);
+    /* The way to a progression of one's own; it lands at the end of the Chord
+     * list and starts playing straight away. */
+    lv_obj_t* mine = make_row(s_overlay, kRowH);
+    lv_obj_t* ml = lv_label_create(mine);
+    lv_obj_set_flex_grow(ml, 1);
+    lv_label_set_text(ml, "Own progression");
+    make_button(mine, 86, "EDIT ...", prog_new_cb, s_overlayGroup);
     lv_obj_t* note = lv_label_create(s_overlay);
     lv_obj_set_width(note, LV_PCT(100));
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
@@ -1198,8 +1425,12 @@ void take_host()
          * semitones either way -- a drum loop detected at F#6 otherwise
          * played three octaves down, a murmur. */
         if (s_followRoot && s_spec.instrument.zones.size() == 1 && s_spec.instrument.zones[0].root >= 0) {
+            /* Put the sample's own note under the pads rather than three
+             * octaves below them: its pitch class becomes the key and its
+             * octave the one the grid starts in. */
             const int root = (int)std::lround(s_spec.instrument.zones[0].root);
-            s_base = (uint8_t)std::max(0, std::min(127 - (kPads - 1), root - 7));
+            const int oct  = std::max(-2, std::min(4, root / 12 - 3));
+            set_mapping(oct, ((root % 12) + 12) % 12, s_scale, s_transpose, s_chordIdx);
         }
         s_followRoot = false;
         s_playable.store(state == crosspad::IInstrumentHost::State::Ready);
@@ -1319,6 +1550,8 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     make_button(top, 48, "EDIT", edit_cb, g);
     make_button(top, 48, "SAVE", save_cb, g);
 
+    load_customs();   // and hand them back to MusicTheory
+    if (s_oct == 0 && s_key == 0 && s_scale == 0 && s_chordIdx == 0) s_oct = kOctDefault;
     rebuild_pads();
 
     // -- the pads, bottom left first --

@@ -13,6 +13,7 @@ idf_component_register(
         crosspad-core
         crosspad-gui
         lvgl
+        nvs_flash      # the player's own progressions outlive a reboot
 )
 
 # WHOLE_ARCHIVE keeps the REGISTER_APP-generated _register_PitchPlay_app()

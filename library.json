@@ -1,6 +1,6 @@
 {
     "name": "crosspad-pitchplay",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
     "keywords": ["crosspad", "pitchplay", "lvgl", "pitched", "sampler"],
     "dependencies": {
