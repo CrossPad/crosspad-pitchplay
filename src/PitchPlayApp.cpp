@@ -124,6 +124,10 @@ lv_obj_t* s_cells[kPads] = {};
 lv_obj_t* s_overlay = nullptr;
 lv_obj_t* s_zoneList = nullptr;
 lv_obj_t* s_rootLabel = nullptr;
+lv_obj_t* s_loopLabel = nullptr;   ///< "0.42 - 1.85 s", or OFF
+lv_obj_t* s_loopFill  = nullptr;   ///< the lit part of the loop bar
+lv_obj_t* s_loopBtn   = nullptr;   ///< ON/OFF for the selected zone's loop
+PP_SLOW_BSS lv_obj_t* s_keyCell[12];   ///< the scale strip, one per pitch class
 lv_obj_t* s_nameArea = nullptr;
 lv_timer_t* s_timer = nullptr;
 lv_group_t* s_encGroup = nullptr;
@@ -573,6 +577,7 @@ int number_step(lv_event_t* e)
 // ── showing ────────────────────────────────────────────────────────────────
 
 void show_scale_line();
+void show_key_strip();     // the chromatic strip in the SCALE window
 
 void show_pads()
 {
@@ -782,6 +787,9 @@ void close_overlay()
     for (auto& c : s_progChip) c = nullptr;
     for (auto& v : s_progVal) v = nullptr;
     s_ov = Overlay::None;
+    s_loopLabel = s_loopFill = s_loopBtn = nullptr;
+    for (auto& c : s_keyCell) c = nullptr;
+
 }
 
 /// A full-screen panel over the app, a column, with its own encoder group.
@@ -934,6 +942,7 @@ void open_browser(bool forZone)
 // ── EDIT ───────────────────────────────────────────────────────────────────
 
 void show_zones();
+void show_loop();          // the loop row, defined with the rest of EDIT
 
 void zone_cb(lv_event_t* e)
 {
@@ -975,6 +984,7 @@ void show_zones()
         lv_label_set_text(l, "No zones. ADD takes a WAV from the card.");
     }
     show_root();
+    show_loop();
 }
 
 void root_by(int step)
@@ -985,6 +995,127 @@ void root_by(int step)
     const int r = z.root < 0 ? 60 : (int)std::lround(z.root);
     z.root = (float)std::max(0, std::min(127, r + step));
     s_dirty = true;
+    show_zones();
+}
+
+/* ── the selected zone's loop ──────────────────────────────────────────────
+ *
+ * The spec stores loop points as frames, which say nothing on their own, so
+ * the window asks the host how long the zone's PCM is and at what rate
+ * (IInstrumentHost::zoneAudio) and shows seconds. A host that cannot say --
+ * nothing loaded yet, or the PC simulator -- reports zero frames, and then
+ * the row says so instead of inventing a length.
+ *
+ * loopEnd == 0 is the one-shot the loader already understands, so OFF is not
+ * a separate flag to keep in step: it is end = 0. */
+crosspad::IInstrumentHost::ZoneAudio zone_audio()
+{
+    auto* h = host();
+    if (!h || s_zoneSel < 0) return {};
+    return h->zoneAudio((uint8_t)s_zoneSel);
+}
+
+void show_loop()
+{
+    const auto& zones = s_spec.instrument.zones;
+    const bool have = s_zoneSel >= 0 && s_zoneSel < (int)zones.size();
+    const auto za = zone_audio();
+    if (s_loopLabel) {
+        char buf[48];
+        if (!have) {
+            std::snprintf(buf, sizeof(buf), "--");
+        } else if (!zones[s_zoneSel].loopEnd) {
+            std::snprintf(buf, sizeof(buf), "one-shot");
+        } else if (!za.frames || !za.sampleRate) {
+            /* The points are real and will be used; only their length is not
+             * known yet, so show the frames rather than a wrong time. */
+            std::snprintf(buf, sizeof(buf), "%u-%u fr", (unsigned)zones[s_zoneSel].loopStart,
+                          (unsigned)zones[s_zoneSel].loopEnd);
+        } else {
+            const float sr = (float)za.sampleRate;
+            std::snprintf(buf, sizeof(buf), "%.2f - %.2f s",
+                          (double)(zones[s_zoneSel].loopStart / sr),
+                          (double)(zones[s_zoneSel].loopEnd / sr));
+        }
+        lv_label_set_text(s_loopLabel, buf);
+    }
+    if (s_loopBtn) {
+        const bool on = have && zones[s_zoneSel].loopEnd != 0;
+        lv_label_set_text(lv_obj_get_child(s_loopBtn, 0), on ? "ON" : "OFF");
+        lv_obj_set_style_bg_color(s_loopBtn, on ? kAccent : kPanel, 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(s_loopBtn, 0), on ? kInk : kText, 0);
+    }
+    if (s_loopFill) {
+        /* The region over the whole sample. Nothing to scale against means
+         * nothing to draw, which is honest. */
+        const bool drawable = have && zones[s_zoneSel].loopEnd && za.frames;
+        lv_obj_set_style_opa(s_loopFill, drawable ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        if (drawable) {
+            const uint32_t f = za.frames;
+            int x = (int)((uint64_t)zones[s_zoneSel].loopStart * 100 / f);
+            int w = (int)((uint64_t)(zones[s_zoneSel].loopEnd - zones[s_zoneSel].loopStart) * 100 / f);
+            if (w < 1) w = 1;
+            if (x > 99) x = 99;
+            if (x + w > 100) w = 100 - x;
+            lv_obj_set_x(s_loopFill, LV_PCT(x));
+            lv_obj_set_width(s_loopFill, LV_PCT(w));
+        }
+    }
+}
+
+/// Two hundred steps across the sample, so one press is a visible move on any
+/// length; a zone whose length is unknown steps by a flat 1000 frames.
+uint32_t loop_step()
+{
+    const auto za = zone_audio();
+    return za.frames ? std::max<uint32_t>(1, za.frames / 200) : 1000u;
+}
+
+/// @p which 0 = start, 1 = end. The two never cross, and the end is what
+/// switches a one-shot into a loop.
+void loop_by(int which, int dir)
+{
+    auto& zones = s_spec.instrument.zones;
+    if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
+    auto& z = zones[s_zoneSel];
+    const auto za = zone_audio();
+    const uint32_t len = za.frames;                 // 0 = unknown, so unclamped
+    const int64_t step = (int64_t)loop_step() * dir;
+    if (which == 0) {
+        int64_t v = (int64_t)z.loopStart + step;
+        const int64_t hi = z.loopEnd ? (int64_t)z.loopEnd - 1 : (len ? (int64_t)len - 1 : v);
+        z.loopStart = (uint32_t)std::max<int64_t>(0, std::min(hi, v));
+    } else {
+        /* From a one-shot, the first + opens a loop over the whole sample
+         * rather than a zero-length one at the start, which would be silent. */
+        int64_t cur = z.loopEnd ? (int64_t)z.loopEnd : (len ? (int64_t)len : 0);
+        if (!z.loopEnd && dir > 0) { z.loopEnd = (uint32_t)cur; s_dirty = true; show_loop(); show_zones(); return; }
+        int64_t v = cur + step;
+        const int64_t lo = (int64_t)z.loopStart + 1;
+        const int64_t hi = len ? (int64_t)len : v;
+        v = std::max(lo, std::min(hi, v));
+        z.loopEnd = (uint32_t)v;
+    }
+    s_dirty = true;
+    show_loop();
+    show_zones();
+}
+
+void loop_toggle_cb(lv_event_t*)
+{
+    auto& zones = s_spec.instrument.zones;
+    if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
+    auto& z = zones[s_zoneSel];
+    if (z.loopEnd) {
+        z.loopEnd = 0;                       // one-shot; the start is kept
+    } else {
+        const auto za = zone_audio();
+        z.loopStart = 0;
+        z.loopEnd = za.frames ? za.frames : 0;
+        if (!z.loopEnd) { show_loop(); return; }   // nothing to loop over yet
+    }
+    s_dirty = true;
+    show_loop();
     show_zones();
 }
 
@@ -1018,6 +1149,42 @@ void open_edit()
         s_dirty = true;
         show_zones();
     }, s_overlayGroup);
+
+    /* LOOP, under ROOT: the start and the end of the selected zone's loop,
+     * ON/OFF being end = 0 (the one-shot the loader already knows). The bar
+     * under the row is the region over the whole sample -- no waveform, on
+     * purpose: a decoded picture here is the sort of PSRAM a pitched bank
+     * needs, and the numbers plus a region answer "where am I" already. */
+    lv_obj_t* lrow = make_row(s_overlay, kRowH);
+    lv_obj_t* ll = lv_label_create(lrow);
+    lv_obj_set_style_text_color(ll, kDim, 0);
+    lv_label_set_text(ll, "LOOP");
+    s_loopBtn = make_button(lrow, 42, "OFF", loop_toggle_cb, s_overlayGroup);
+    make_button(lrow, 28, "S-", [](lv_event_t*) { loop_by(0, -1); }, s_overlayGroup);
+    make_button(lrow, 28, "S+", [](lv_event_t*) { loop_by(0, 1); }, s_overlayGroup);
+    s_loopLabel = lv_label_create(lrow);
+    lv_obj_set_flex_grow(s_loopLabel, 1);
+    lv_obj_set_style_text_align(s_loopLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_loopLabel, kAccent, 0);
+    lv_label_set_text(s_loopLabel, "--");
+    make_button(lrow, 28, "E-", [](lv_event_t*) { loop_by(1, -1); }, s_overlayGroup);
+    make_button(lrow, 28, "E+", [](lv_event_t*) { loop_by(1, 1); }, s_overlayGroup);
+
+    lv_obj_t* bar = lv_obj_create(s_overlay);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, LV_PCT(100), 6);
+    lv_obj_set_style_radius(bar, 3, 0);
+    lv_obj_set_style_bg_color(bar, kPanel, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    s_loopFill = lv_obj_create(bar);
+    lv_obj_remove_style_all(s_loopFill);
+    lv_obj_set_height(s_loopFill, LV_PCT(100));
+    lv_obj_set_width(s_loopFill, LV_PCT(0));
+    lv_obj_set_style_radius(s_loopFill, 3, 0);
+    lv_obj_set_style_bg_color(s_loopFill, kAccent, 0);
+    lv_obj_set_style_bg_opa(s_loopFill, LV_OPA_TRANSP, 0);
+
     show_zones();
 }
 
@@ -1171,6 +1338,7 @@ void show_scale_line()
     std::snprintf(buf, sizeof(buf), "%+d", s_transpose);
     lv_label_set_text(s_scaleVal[2], buf);
     lv_label_set_text(s_scaleVal[3], s_mt.chordName((uint8_t)s_chordIdx));
+    show_key_strip();        // the picture and the names are one thing
 }
 
 /// -1 or +1 on one of the four, from the button's user data: (which << 1) | up.
@@ -1386,10 +1554,73 @@ void prog_new_cb(lv_event_t*)
     prog_open(slot);
 }
 
+/* ── the scale, as a shape ─────────────────────────────────────────────────
+ *
+ * Four rows of names tell you the key and the scale; they do not tell you
+ * what you are about to play. One chromatic octave does: twelve cells laid
+ * out like a keyboard, the ones in the scale lit, the key ringed, and a dot
+ * on every cell some pad actually sounds.
+ *
+ * Pitch classes, not notes, so it reads the same whatever octave or
+ * transpose is set -- and the dots come from pad_note(), the same function
+ * the pads are labelled from, so the picture cannot drift from the sound.
+ * No scale table is read here: whether a pitch class is in the scale is
+ * answered by asking whether any pad plays it, which is what the player
+ * cares about and what rebuildPadMap() has already decided. */
+constexpr bool kBlackKey[12] = {false, true, false, true, false,
+                                false, true, false, true, false, true, false};
+
+void show_key_strip()
+{
+    if (!s_keyCell[0]) return;
+    uint16_t played = 0;                       // pitch classes some pad sounds
+    for (uint8_t pad = 0; pad < kPads; ++pad) {
+        const int n = pad_note(pad);
+        if (n >= 0) played = (uint16_t)(played | (1u << (n % 12)));
+    }
+    for (int pc = 0; pc < 12; ++pc) {
+        lv_obj_t* c = s_keyCell[pc];
+        const bool in   = (played & (1u << pc)) != 0;
+        const bool root = (pc == s_key);
+        lv_obj_set_style_bg_color(c, in ? kAccent : (kBlackKey[pc] ? kInk : kPanel), 0);
+        lv_obj_set_style_border_width(c, root ? 2 : 0, 0);
+        lv_obj_set_style_border_color(c, kText, 0);
+        lv_obj_t* l = lv_obj_get_child(c, 0);
+        if (l) {
+            lv_obj_set_style_text_color(l, in ? kInk : kDim, 0);
+            /* The name only on the key and on the black notes' neighbours
+             * would be guesswork; every cell carries it, two characters at
+             * most, and the lit ones read first because of the contrast. */
+            lv_label_set_text(l, pitch_name(pc, s_key));
+        }
+    }
+}
+
+void build_key_strip()
+{
+    lv_obj_t* row = make_row(s_overlay, 30);
+    lv_obj_set_style_pad_column(row, 2, 0);
+    for (int pc = 0; pc < 12; ++pc) {
+        lv_obj_t* c = lv_obj_create(row);
+        lv_obj_remove_style_all(c);
+        lv_obj_set_flex_grow(c, 1);
+        lv_obj_set_height(c, LV_PCT(100));
+        lv_obj_set_style_radius(c, 3, 0);
+        lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* l = lv_label_create(c);
+        lv_obj_center(l);
+        lv_label_set_text(l, "");
+        s_keyCell[pc] = c;
+    }
+    show_key_strip();
+}
+
 void scale_cb(lv_event_t*)
 {
     open_overlay(Overlay::Scale);
     overlay_header("Key, scale and chords");
+    build_key_strip();
     scale_row("Key", 0);
     scale_row("Scale", 1);
     scale_row("Transpose", 2);
