@@ -3,12 +3,17 @@
  * @brief Pitch Play -- one sample or many, played chromatically on the pads and
  *        from a MIDI keyboard.
  *
- *   top     back, the instrument -- a drop-down of the saved instruments, the
- *           Recorder's takes and "the card ..." for any WAV --, EDIT, SAVE
- *   pads    the sixteen pads as they sound, bottom left first: each its note,
- *           underlined in the colour of the zone that plays it, lit while it
- *           sounds; a touch plays it too
- *   bottom  OCT- / the pads' range / OCT+, VOL (turned)
+ *   context  the instrument (tap: the sample window), then what the pads are
+ *            set to as plain fields -- the key and scale, the octave, what a
+ *            pad makes. No back button: back is the power button's click.
+ *   pads     the sixteen pads as they sound, bottom left first: each its
+ *            note, underlined in the colour of the zone that plays it, lit
+ *            while it sounds; a touch plays it too
+ *   right    the note last played and how hard, the selected zone's waveform,
+ *            its envelope, the pads' range, and the level (turned)
+ *   keys     SCALE, OCT-, OCT+, CHORD, SAMPLE > -- the five of UX 2000 5.9.
+ *            EDIT and SAVE live in the sample window behind SAMPLE >, which
+ *            is the one key on the row that leads somewhere.
  *
  * A sample picked from the list is an instrument of one zone, its pitch
  * detected. EDIT lists the zones -- each a sample and the note it sounds
@@ -31,6 +36,7 @@
 #endif
 
 #include "crosspad/app/AppRegistrar.hpp"
+#include "crosspad/instrument/InstrumentPlayState.hpp"
 #include "crosspad/event/EventData.hpp"
 #include "crosspad/event/IEventBus.hpp"
 #include "crosspad/instrument/IInstrumentHost.hpp"
@@ -45,6 +51,8 @@
 #include "crosspad/pad/PadManager.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
 #include "crosspad/sampletools/ISampleTools.hpp"
+#include "crosspad-gui/components/transport_bar.h"
+#include "crosspad-gui/components/ui_toast.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
 
 #include "lvgl.h"
@@ -68,6 +76,10 @@ extern "C" {
 namespace {
 
 constexpr uint32_t kTickMs   = 50;
+/* A screen y as a y inside the root, which begins under the transport bar.
+ * The whole screen is laid out in the design's screen coordinates and this is
+ * the only place the shift happens. */
+#define PP_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
 constexpr uint8_t  kPads     = 16;
 constexpr int      kChordMax = 4;    ///< notes in the widest chord a pad makes
 
@@ -95,6 +107,10 @@ const lv_color_t kDim    = lv_color_hex(0x7B828B);
 const lv_color_t kInk    = lv_color_hex(0x16181B);
 const lv_color_t kAccent = lv_color_hex(0xC6FF47);
 const lv_color_t kHead   = lv_color_hex(0xFFFFFF);
+/* The instrument's own colour -- the first zone's, which is also the one the
+ * pads of zone 1 are underlined in -- and the well its picture sits in. */
+const lv_color_t kZone0  = lv_color_hex(0xA77BF0);
+const lv_color_t kWaveBg = lv_color_hex(0x1B1622);
 
 /// A colour per zone, round again past eight: the pads say which zone plays them.
 const uint32_t kZoneRgb[] = {0xC6FF47, 0x4FE0B0, 0x8B5CF6, 0xFFC857,
@@ -103,7 +119,7 @@ constexpr size_t kZoneColors = sizeof(kZoneRgb) / sizeof(kZoneRgb[0]);
 
 enum class Wait : uint8_t { None, Load, Save };
 enum class Listing : uint8_t { None, Library, Takes };
-enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale, Prog };
+enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale, Prog, Sample };
 enum class EntryKind : uint8_t { Instrument, Sample, Card };
 
 struct Entry {
@@ -112,11 +128,15 @@ struct Entry {
 };
 
 lv_obj_t* s_root = nullptr;
-lv_obj_t* s_dropdown = nullptr;
-lv_obj_t* s_info = nullptr;
 lv_obj_t* s_range = nullptr;
 lv_obj_t* s_volBtn = nullptr;
-lv_obj_t* s_scaleBtn = nullptr;     ///< top row: the key and scale, in short
+lv_obj_t* s_scaleBtn = nullptr;     ///< context row: the key and scale, in short
+lv_obj_t* s_nameBtn  = nullptr;     ///< context row: the instrument, in its colour
+lv_obj_t* s_octField = nullptr;     ///< context row: "OCT 3"
+lv_obj_t* s_chordField = nullptr;   ///< context row: "CHORD off"
+lv_obj_t* s_noteLbl  = nullptr;     ///< right panel: "G3 - vel 96"
+lv_obj_t* s_waveBox  = nullptr;     ///< right panel: the selected zone's picture
+lv_obj_t* s_envLbl   = nullptr;     ///< right panel: "ATK 2  REL 40  GLIDE 0"
 PP_SLOW_BSS lv_obj_t* s_scaleVal[4];   ///< the window's four value labels
 PP_SLOW_BSS lv_obj_t* s_progChip[8];    ///< the progression editor's step chips
 PP_SLOW_BSS lv_obj_t* s_progVal[2];     ///< its degree and chord values
@@ -147,9 +167,28 @@ Wait    s_wait = Wait::None;
 Listing s_listing = Listing::None;
 std::vector<std::string> s_library;   // instrument names
 std::vector<std::string> s_takes;     // logical paths
-std::vector<Entry> s_entries;         // what the drop-down offers, in its order
+std::vector<Entry> s_entries;         // what the sample window offers, in its order
+std::vector<std::string> s_labels;    // and how each of them reads
+/* The window shows a page of them, not all. A board with a few hundred takes
+ * made 229 rows of this list, and the 200 kB of PSRAM they took is most of
+ * what the pitched bank then had to load into -- the same trap the kit
+ * selector is a virtual list for. Measured: 404 kB free before the window,
+ * 204 kB with it open. */
+uint32_t s_samplePage = 0;
 char    s_ddText[48] = "Pick a sample";
-bool    s_fillPending = false;        // a listing came in while the list was open
+bool    s_fillPending = false;        // a listing came in while the sample window is open
+
+/* The note last played, for the right panel. Written from play_one(), so a
+ * pad, a touch and a MIDI key all say the same thing. */
+std::atomic<uint8_t> s_lastNote{0};
+std::atomic<uint8_t> s_lastVel{0};
+
+/* The selected zone's picture: columns asked of the tools and drawn in the
+ * waveform box. Requested once per zone, and never while a folder listing is
+ * out -- the tools run one job at a time. */
+crosspad::WaveOverview s_wave;
+bool        s_wavePending = false;
+std::string s_waveWant;               ///< the file the pending request is for
 
 Overlay s_ov = Overlay::None;
 bool    s_browseForZone = false;       // the card's WAV becomes a zone, not an instrument
@@ -283,6 +322,22 @@ PP_SLOW_BSS int s_transpose;    ///< semitones, -12..+12, on top of all of it
 
 int clamp_note(int n) { return n < 0 ? 0 : (n > 127 ? 127 : n); }
 
+/* Pitch Play is the only writer of the shared state (core's
+ * InstrumentPlayState): the Sequencer recording an instrument and the
+ * Recorder bouncing one have to sound like these pads do, and they only can
+ * if they read this instead of keeping a copy of the key, the scale and the
+ * chord. Published from the two places the state can change -- the map here,
+ * the instrument when a load lands. */
+void publish_play_state()
+{
+    auto& st = crosspad::instrumentPlayState();
+    st.play = s_ps;                  // rebuildPadMap() has already run on it
+    const char* cn = s_mt.chordName((uint8_t)s_chordIdx);
+    st.chordName = cn ? cn : "";     // named here: only this MusicTheory knows
+                                     // the player's own progressions
+    crosspad::instrumentPlayStatePublished();
+}
+
 void rebuild_pads()
 {
     s_ps.rootNote   = (uint8_t)s_key;
@@ -290,7 +345,7 @@ void rebuild_pads()
     s_ps.scaleIndex = (uint8_t)s_scale;
     s_ps.chordIndex = (uint8_t)s_chordIdx;
     s_mt.rebuildPadMap(s_ps);
-    if (s_transpose == 0) return;
+    if (s_transpose == 0) { publish_play_state(); return; }
     for (int pad = 0; pad < kPads; ++pad) {
         s_ps.padMidiMap[pad] = (uint8_t)clamp_note(s_ps.padMidiMap[pad] + s_transpose);
         for (int c = 0; c < 6; ++c) {
@@ -299,6 +354,7 @@ void rebuild_pads()
                 (uint8_t)clamp_note(s_ps.padChordNotes[pad][c] + s_transpose);
         }
     }
+    publish_play_state();
 }
 
 /// Which pad sounds @p note, or -1. Scans: a scale leaves gaps.
@@ -419,6 +475,11 @@ void play_one(uint8_t note, uint8_t vel, uint8_t pad)
 {
     auto* p = inst();
     if (!p || !s_playable.load()) return;
+    /* What the right panel names. Here rather than in the pad handler: a
+     * touch, a pad and a MIDI key all come through this one call, so the
+     * panel says what was actually sounded whichever way it arrived. */
+    s_lastNote.store(note);
+    s_lastVel.store(vel ? vel : 1);
     p->noteOn(note, vel ? vel : 1, pad);
 }
 
@@ -639,26 +700,123 @@ void show_volume()
 
 void show_name()
 {
-    if (!s_dropdown) return;
+    if (!s_nameBtn) return;
     std::snprintf(s_ddText, sizeof(s_ddText), "%s%s", s_haveSpec ? s_spec.name.c_str() : "Pick a sample",
                   s_dirty ? " *" : "");
-    lv_dropdown_set_text(s_dropdown, s_ddText);
-    lv_obj_invalidate(s_dropdown);
+    lv_label_set_text(lv_obj_get_child(s_nameBtn, 0), s_ddText);
 }
 
+/// What this screen has to say that the panel does not.
+///
+/// A toast, because the design gives Pitch Play no status row: the right
+/// panel is the state -- the note, the picture, the envelope, the range --
+/// and everything else here is something that just happened, which is what a
+/// toast is for. Only when it changes, or a line would be raised again every
+/// tick.
 void show_info(const char* text = nullptr)
 {
-    if (!s_info) return;
-    if (text) { lv_label_set_text(s_info, text); return; }
-    if (!s_haveSpec) {
-        lv_label_set_text(s_info, "A sample from the list plays on every pad, in tune.");
-        return;
+    if (!text || !*text) return;
+    static char last[128] = {};
+    if (std::strncmp(last, text, sizeof(last)) == 0) return;
+    std::snprintf(last, sizeof(last), "%s", text);
+    ui_toast_show(text, 2500, UI_TOAST_INFO);
+}
+
+// ── the right panel (UX 2000 5.9) ─────────────────────────────────────────
+
+/// "G3 - vel 96": the note last sounded, however it was played.
+void show_note()
+{
+    if (!s_noteLbl) return;
+    const uint8_t n = s_lastNote.load(), v = s_lastVel.load();
+    if (!v) { lv_label_set_text(s_noteLbl, "--"); return; }
+    char name[8], buf[24];
+    note_name(n, name, sizeof(name));
+    std::snprintf(buf, sizeof(buf), "%s  -  vel %u", name, (unsigned)v);
+    lv_label_set_text(s_noteLbl, buf);
+}
+
+/// The envelope, from the spec. The design's third field is GLIDE; the
+/// pitched engine has no glide, so it is not drawn rather than drawn as a
+/// zero that cannot be changed.
+void show_env()
+{
+    if (!s_envLbl) return;
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "ATK %u ms    REL %u ms",
+                  (unsigned)s_spec.instrument.attackMs, (unsigned)s_spec.instrument.releaseMs);
+    lv_label_set_text(s_envLbl, buf);
+}
+
+/// The context row's plain fields: what the pads are set to.
+void show_fields()
+{
+    char buf[24];
+    if (s_octField) {
+        std::snprintf(buf, sizeof(buf), "OCT %d", s_oct + 3);   // MusicTheory's base is (3+oct)*12
+        lv_label_set_text(s_octField, buf);
     }
-    const size_t n = s_spec.instrument.zones.size();
-    char buf[96];
-    std::snprintf(buf, sizeof(buf), "%u zone%s   |   %s", (unsigned)n, n == 1 ? "" : "s",
-                  s_playable.load() ? "pads and MIDI play it" : "not loaded");
-    lv_label_set_text(s_info, buf);
+    if (s_chordField) {
+        const char* cn = s_mt.chordName((uint8_t)s_chordIdx);
+        std::snprintf(buf, sizeof(buf), "%.10s", (pads_are_chords() && cn) ? cn : "CHORD off");
+        lv_label_set_text(s_chordField, buf);
+    }
+}
+
+/// The selected zone's file, or "" when there is none to draw.
+std::string wave_file()
+{
+    const auto& zs = s_spec.instrument.zones;
+    if (!s_haveSpec || zs.empty()) return {};
+    const int i = (s_zoneSel >= 0 && s_zoneSel < (int)zs.size()) ? s_zoneSel : 0;
+    return zs[(size_t)i].sample;
+}
+
+/// Ask the tools for the columns of the zone now selected.
+///
+/// One job at a time is all the tools run, and the folder listings this app
+/// makes are the ones a player is waiting on, so a picture is only ever asked
+/// for when nothing else is out -- and asked for once per file.
+void request_wave()
+{
+    auto* st = tools();
+    if (!st || s_wavePending || s_folderPending || s_listing != Listing::None) return;
+    const std::string f = wave_file();
+    if (f.empty() || f == s_wave.file) return;
+    if (!st->requestOverview(f, 0, 0, 150)) return;
+    s_wavePending = true;
+    s_waveWant = f;
+}
+
+/// The zone, drawn as the min/max columns the tools read, in the colour of
+/// the zone it is -- the same colour the pads it plays are underlined in.
+void wave_draw_cb(lv_event_t* e)
+{
+    if (s_wave.hi.empty() || s_wave.hi.size() != s_wave.lo.size()) return;
+    lv_obj_t* box = lv_event_get_target_obj(e);
+    lv_layer_t* layer = lv_event_get_layer(e);
+    lv_area_t a;
+    lv_obj_get_coords(box, &a);
+    const int32_t w = a.x2 - a.x1 + 1, h = a.y2 - a.y1 + 1;
+    if (w <= 2 || h <= 4) return;
+    const int32_t mid = a.y1 + h / 2, half = h / 2 - 1;
+
+    lv_draw_fill_dsc_t d;
+    lv_draw_fill_dsc_init(&d);
+    const int zi = (s_zoneSel >= 0) ? s_zoneSel : 0;
+    d.color = lv_color_hex(kZoneRgb[(size_t)zi % kZoneColors]);
+    d.opa = LV_OPA_COVER;
+    const size_t cols = s_wave.hi.size();
+    for (int32_t x = 0; x < w; ++x) {
+        const size_t i = (size_t)((uint64_t)x * cols / (uint64_t)w);
+        if (i >= cols) break;
+        int32_t hi = (int32_t)s_wave.hi[i] * half / 127;
+        int32_t lo = (int32_t)s_wave.lo[i] * half / 127;
+        if (hi < lo) { const int32_t t = hi; hi = lo; lo = t; }
+        if (hi - lo < 1) { hi = 1; lo = -1; }
+        const lv_area_t r = {a.x1 + x, mid - hi, a.x1 + x, mid - lo};
+        lv_draw_fill(layer, &d, &r);
+    }
 }
 
 // ── the engine ─────────────────────────────────────────────────────────────
@@ -722,48 +880,45 @@ void request_listing()
     if (st->requestFolder(st->cardRoot() + h->libraryRoot())) s_listing = Listing::Library;
 }
 
-/* The first row is a heading, and the list goes back to it after every
- * choice: LVGL tells a choice made with the encoder only when it differs
- * from the one before, so picking the same sample twice -- or the first
- * row -- would otherwise do nothing. */
-constexpr const char* kHeading = "Instruments and samples";
+void open_sample_window();
 
+/// What the sample window offers, in its order: the saved instruments, the
+/// Recorder's takes, and the card for any WAV.
 void fill_dropdown()
 {
-    if (!s_dropdown) return;
-    /* Not under the finger: options replaced while the list is open close it
-     * or shift what the encoder points at. */
-    if (lv_dropdown_is_open(s_dropdown)) { s_fillPending = true; return; }
-    s_fillPending = false;
     s_entries.clear();
-    std::string opts = kHeading;
-    auto add = [&](EntryKind k, const std::string& path, const std::string& label) {
-        if (!opts.empty()) opts += "\n";
-        opts += label;
-        s_entries.push_back({k, path});
-    };
+    s_labels.clear();
     auto* h = host();
+    if (!h) return;
     for (const auto& n : s_library) {
-        add(EntryKind::Instrument, h->libraryRoot() + "/" + n + "/" + crosspad::IInstrumentHost::kFileName,
-            std::string(LV_SYMBOL_KEYBOARD " ") + n);
+        s_entries.push_back({EntryKind::Instrument,
+                             h->libraryRoot() + "/" + n + "/" + crosspad::IInstrumentHost::kFileName});
+        s_labels.push_back(std::string(LV_SYMBOL_KEYBOARD " ") + n);
     }
-    for (const auto& t : s_takes) add(EntryKind::Sample, t, std::string(LV_SYMBOL_AUDIO " ") + base_of(t));
-    add(EntryKind::Card, "", LV_SYMBOL_DIRECTORY " The card ...");
-    lv_dropdown_set_options(s_dropdown, opts.c_str());
-    lv_dropdown_set_selected(s_dropdown, 0);
+    for (const auto& t : s_takes) {
+        s_entries.push_back({EntryKind::Sample, t});
+        s_labels.push_back(std::string(LV_SYMBOL_AUDIO " ") + base_of(t));
+    }
+    s_entries.push_back({EntryKind::Card, ""});
+    s_labels.push_back(LV_SYMBOL_DIRECTORY " The card ...");
     show_name();
+    /* A listing that came in while the window is open fills it where it
+     * stands, rather than leaving the player looking at an empty list. */
+    if (s_ov == Overlay::Sample) { s_fillPending = false; open_sample_window(); }
 }
 
 void open_browser(bool forZone);
+void close_overlay();
 
-void dropdown_cb(lv_event_t* e)
+/// A row of the sample window. The entry it stands for is its index, or the
+/// "more" row, which turns the page instead of picking anything.
+void sample_pick_cb(lv_event_t* e)
 {
-    lv_obj_t* dd = static_cast<lv_obj_t*>(lv_event_get_target(e));
-    const uint32_t row = lv_dropdown_get_selected(dd);
-    lv_dropdown_set_selected(dd, 0);
-    show_name();
-    if (row == 0 || row - 1 >= s_entries.size()) return;
-    const Entry entry = s_entries[row - 1];
+    const size_t i = (size_t)(intptr_t)lv_event_get_user_data(e);
+    if (i == SIZE_MAX - 1) { s_samplePage += kPageRows; open_sample_window(); return; }
+    if (i >= s_entries.size()) return;
+    const Entry entry = s_entries[i];
+    close_overlay();
     switch (entry.kind) {
     case EntryKind::Instrument: open_instrument(entry.path); break;
     case EntryKind::Sample:     open_sample(entry.path); break;
@@ -1268,13 +1423,58 @@ void save_cb(lv_event_t*)
     }
 }
 
-// ── the main row callbacks ─────────────────────────────────────────────────
+// ── SAMPLE > : the one key on the row that leads somewhere ────────────────
 
-void back_cb(lv_event_t* e)
+/* The saved instruments, the Recorder's takes and the card -- what the
+ * drop-down in the old top row offered -- and with them the two things that
+ * make an instrument rather than pick one: EDIT (its zones) and SAVE. The
+ * design's key row has five keys and neither EDIT nor SAVE is one of them, so
+ * this is where they belong: they are about the sample, and this is the
+ * sample window. */
+void open_sample_window()
 {
-    auto* app = static_cast<App*>(lv_event_get_user_data(e));
-    if (app) app->destroyAppAsync();
+    open_overlay(Overlay::Sample);
+    overlay_header("Sample");
+    lv_obj_t* col = scroll_column(s_overlay);
+    if (s_entries.empty()) {
+        lv_obj_t* l = lv_label_create(col);
+        lv_obj_set_style_text_color(l, kDim, 0);
+        lv_label_set_text(l, "Reading the card ...");
+    }
+    const size_t total = std::min(s_entries.size(), s_labels.size());
+    if (s_samplePage >= total) s_samplePage = 0;
+    const size_t end = std::min<size_t>(total, (size_t)s_samplePage + kPageRows);
+    for (size_t i = s_samplePage; i < end; ++i) {
+        list_item(col, s_labels[i].c_str(), sample_pick_cb, (void*)(intptr_t)i);
+    }
+    if (end < total) {
+        char more[48];
+        std::snprintf(more, sizeof(more), LV_SYMBOL_DOWN "  %u more ...", (unsigned)(total - end));
+        list_item(col, more, sample_pick_cb, (void*)(intptr_t)(SIZE_MAX - 1));
+    }
+    list_item(col, LV_SYMBOL_SETTINGS "  Edit the zones ...",
+              [](lv_event_t* e) { close_overlay(); edit_cb(e); }, nullptr);
+    list_item(col, LV_SYMBOL_SAVE "  Save as ...",
+              [](lv_event_t* e) { close_overlay(); save_cb(e); }, nullptr);
 }
+
+void sample_cb(lv_event_t*)
+{
+    if (s_ov != Overlay::None) return;
+    s_samplePage = 0;          // the window opens at the top, every time
+    open_sample_window();
+}
+
+/// CHORD: the next of what a pad makes. The field in the context row says
+/// which; SCALE is where the rest of the mapping is set.
+void step_chord(int d);
+void chord_cb(lv_event_t*) { step_chord(+1); }
+
+// ── the mapping ────────────────────────────────────────────────────────────
+
+/* No back_cb: this screen has no back button. Back is the power button's
+ * click, which goes up one level and then out, and apps are switched with
+ * MODE and a pad (UX 2000 section 2). */
 
 /* Sixteen degrees of a scale span more than sixteen semitones, so the top
  * pad is what has to stay a note, so the setting is tried on the real map
@@ -1318,8 +1518,11 @@ void volume_cb(lv_event_t* e)
  * VOL, and these are set once and then played, not reached for mid-phrase.
  * The top-row button carries the answer at a glance ("C maj"). */
 
+void show_fields();
+
 void show_scale_line()
 {
+    show_fields();
     if (s_scaleBtn) {
         char buf[16];
         /* Short enough for a 56 px button: the key, three letters of the
@@ -1341,6 +1544,28 @@ void show_scale_line()
     show_key_strip();        // the picture and the names are one thing
 }
 
+/// The next (or previous) of what a pad can make: one note, the chord types,
+/// the two modes, then the progressions. Its own function because the CHORD
+/// key on the soft row steps it as well as the SCALE window's row.
+void step_chord(int d)
+{
+    const int chords = (int)s_mt.totalChordCount();
+    if (chords <= 0) return;
+    /* A progression is degrees, so it is written in a mode: picking one
+     * brings its scale with it, or "Backdoor" would have no flat seventh to
+     * walk down and "Lydian Dream" no major II. The twelve chord types and
+     * the two modes leave the scale alone, and so do the player's own
+     * progressions -- nothing knows what key those were meant in. */
+    const int next = (s_chordIdx + chords + d) % chords;
+    const int first = crosspad::MusicTheory::CHORD_PROG_START_IDX;
+    const int builtins = (int)crosspad::MusicTheory::builtinProgCount();
+    int scale = s_scale;
+    if (next >= first && next < first + builtins) {
+        scale = (int)crosspad::MusicTheory::builtinProgScale((uint8_t)(next - first));
+    }
+    set_mapping(s_oct, s_key, scale, s_transpose, next);
+}
+
 /// -1 or +1 on one of the four, from the button's user data: (which << 1) | up.
 void scale_step_cb(lv_event_t* e)
 {
@@ -1348,28 +1573,11 @@ void scale_step_cb(lv_event_t* e)
     const int which = code >> 1;
     const int d = (code & 1) ? 1 : -1;
     const int scales = (int)crosspad::MusicTheory::scaleCount();
-    const int chords = (int)s_mt.totalChordCount();
     switch (which) {
         case 0: set_mapping(s_oct, (s_key + 12 + d) % 12, s_scale, s_transpose, s_chordIdx); break;
         case 1: set_mapping(s_oct, s_key, (s_scale + scales + d) % scales, s_transpose, s_chordIdx); break;
         case 2: set_mapping(s_oct, s_key, s_scale, s_transpose + d, s_chordIdx); break;
-        default: {
-            /* A progression is degrees, so it is written in a mode: picking
-             * one brings its scale with it, or "Backdoor" would have no flat
-             * seventh to walk down and "Lydian Dream" no major II. The twelve
-             * chord types and the two modes leave the scale alone, and so do
-             * the player's own progressions -- nothing knows what key those
-             * were meant in. */
-            const int next = (s_chordIdx + chords + d) % chords;
-            const int first = crosspad::MusicTheory::CHORD_PROG_START_IDX;
-            const int builtins = (int)crosspad::MusicTheory::builtinProgCount();
-            int scale = s_scale;
-            if (next >= first && next < first + builtins) {
-                scale = (int)crosspad::MusicTheory::builtinProgScale((uint8_t)(next - first));
-            }
-            set_mapping(s_oct, s_key, scale, s_transpose, next);
-            break;
-        }
+        default: step_chord(d); break;
     }
 }
 
@@ -1706,6 +1914,14 @@ void take_host()
         }
         s_followRoot = false;
         s_playable.store(state == crosspad::IInstrumentHost::State::Ready);
+        /* The instrument, for whoever wants to borrow the same one. The host's
+         * own copy is the authority on the path -- s_spec came from it. */
+        if (state == crosspad::IInstrumentHost::State::Ready) {
+            auto& shared = crosspad::instrumentPlayState();
+            shared.instrumentPath = s_spec.path;
+            shared.instrumentName = s_spec.name;
+            crosspad::instrumentPlayStatePublished();
+        }
         apply_volume();
         show_pads();
         show_leds();
@@ -1728,6 +1944,20 @@ void take_tools()
     if (!st) return;
     const auto job = st->job();
     if (job == crosspad::ToolJob::Busy) return;
+    if (s_wavePending) {
+        s_wavePending = false;
+        if (job == crosspad::ToolJob::Ready) {
+            s_wave = st->overview();
+            /* The tools answer whatever was asked last; only our own file is
+             * kept, so a listing that overtook this request cannot leave the
+             * box drawing somebody else's sample. */
+            if (s_wave.file != s_waveWant) s_wave = crosspad::WaveOverview{};
+        } else {
+            s_wave = crosspad::WaveOverview{};
+        }
+        if (s_waveBox) lv_obj_invalidate(s_waveBox);
+        return;
+    }
     if (s_folderPending) {
         s_folderPending = false;
         if (job == crosspad::ToolJob::Ready) {
@@ -1767,6 +1997,8 @@ void tick_cb(lv_timer_t*)
     take_host();
     take_tools();
     if (s_fillPending) fill_dropdown();
+    request_wave();
+    show_note();
     show_lit();
 }
 
@@ -1786,61 +2018,62 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     lv_obj_set_style_bg_color(s_root, kBg, 0);
     lv_obj_set_style_border_width(s_root, 0, 0);
     lv_obj_set_style_radius(s_root, 0, 0);
-    lv_obj_set_style_pad_all(s_root, 5, 0);
-    lv_obj_set_style_pad_row(s_root, 4, 0);
-    lv_obj_set_flex_flow(s_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(s_root, 0, 0);
     lv_obj_set_style_text_color(s_root, kText, 0);
     lv_obj_remove_flag(s_root, LV_OBJ_FLAG_SCROLLABLE);
 
-    // -- back, the instrument, EDIT, SAVE --
-    lv_obj_t* top = make_row(s_root, kRowH);
-    make_button(top, 30, LV_SYMBOL_LEFT, back_cb, g, app);
-    s_dropdown = lv_dropdown_create(top);
-    lv_obj_set_height(s_dropdown, kRowH);
-    lv_obj_set_flex_grow(s_dropdown, 1);
-    lv_obj_set_style_pad_ver(s_dropdown, 4, 0);
-    lv_obj_set_style_pad_hor(s_dropdown, 8, 0);
-    lv_obj_set_style_radius(s_dropdown, 6, 0);
-    lv_obj_set_style_border_width(s_dropdown, 0, 0);
-    lv_obj_set_style_bg_color(s_dropdown, kPanel, 0);
-    lv_obj_set_style_text_color(s_dropdown, kText, 0);
-    lv_obj_set_style_text_font(s_dropdown, &lv_font_montserrat_14, 0);
-    focus_frame(s_dropdown);
-    lv_dropdown_set_options(s_dropdown, kHeading);
-    lv_obj_add_event_cb(s_dropdown, dropdown_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-    if (lv_obj_t* list = lv_dropdown_get_list(s_dropdown)) {
-        lv_obj_set_style_bg_color(list, kPanel, 0);
-        lv_obj_set_style_text_color(list, kText, 0);
-        lv_obj_set_style_text_font(list, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_border_color(list, kAccent, 0);
-        lv_obj_set_style_bg_color(list, kAccent, (lv_style_selector_t)LV_PART_SELECTED | LV_STATE_CHECKED);
-        lv_obj_set_style_text_color(list, kInk, (lv_style_selector_t)LV_PART_SELECTED | LV_STATE_CHECKED);
-        lv_obj_set_style_max_height(list, 180, 0);
-    }
-    if (g) lv_group_add_obj(g, s_dropdown);
-    s_scaleBtn = make_button(top, 56, "", scale_cb, g);
-    make_button(top, 48, "EDIT", edit_cb, g);
-    make_button(top, 48, "SAVE", save_cb, g);
+    /* Absolute positions in the design's screen coordinates; PP_Y shifts them
+     * into the root, which begins under the transport bar. */
+    auto place = [](lv_obj_t* o, int32_t x, int32_t y) { if (o) lv_obj_set_pos(o, x, y); return o; };
+
+    /* ── context row: the instrument, then what the pads are set to ──────
+     * The instrument is the one thing here that leads somewhere (the sample
+     * window); the other three are fields, because the keys at the foot are
+     * what changes them and two controls for one value is one too many. */
+    s_nameBtn = make_button(s_root, 118, "", sample_cb, g);
+    lv_obj_set_height(s_nameBtn, 22);
+    place(s_nameBtn, 6, PP_Y(35));
+    lv_obj_set_style_text_color(lv_obj_get_child(s_nameBtn, 0), kZone0, 0);
+    lv_label_set_long_mode(lv_obj_get_child(s_nameBtn, 0), LV_LABEL_LONG_DOT);
+    lv_obj_set_width(lv_obj_get_child(s_nameBtn, 0), 106);
+
+    auto field = [&](int32_t x, int32_t w) {
+        lv_obj_t* f = lv_obj_create(s_root);
+        lv_obj_remove_style_all(f);
+        lv_obj_set_pos(f, x, PP_Y(35));
+        lv_obj_set_size(f, w, 22);
+        lv_obj_set_style_radius(f, 4, 0);
+        lv_obj_set_style_bg_color(f, kPanel, 0);
+        lv_obj_set_style_bg_opa(f, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(f, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* l = lv_label_create(f);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(l, kText, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+        lv_label_set_text(l, "");
+        lv_obj_center(l);
+        return l;
+    };
+    s_scaleBtn = make_button(s_root, 56, "", scale_cb, g);
+    lv_obj_set_height(s_scaleBtn, 22);
+    place(s_scaleBtn, 128, PP_Y(35));
+    s_octField   = field(188, 48);
+    s_chordField = field(240, 74);
 
     load_customs();   // and hand them back to MusicTheory
     if (s_oct == 0 && s_key == 0 && s_scale == 0 && s_chordIdx == 0) s_oct = kOctDefault;
     rebuild_pads();
 
-    // -- the pads, bottom left first --
-    lv_obj_t* grid = lv_obj_create(s_root);
-    lv_obj_remove_style_all(grid);
-    lv_obj_set_width(grid, LV_PCT(100));
-    lv_obj_set_flex_grow(grid, 1);
-    static const int32_t kCol[] = {LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
-    static const int32_t kRow[] = {LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
-    lv_obj_set_grid_dsc_array(grid, kCol, kRow);
-    lv_obj_set_style_pad_column(grid, 4, 0);
-    lv_obj_set_style_pad_row(grid, 4, 0);
-    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    /* ── the pads, bottom left first ─────────────────────────────────────
+     * 150 px of the 320, so the right half can say what the left one is
+     * playing: four columns of 36 and four rows of 33, 2 px apart. */
+    constexpr int32_t kCellW = 36, kCellH = 33, kCellGap = 2;
     for (uint8_t pad = 0; pad < kPads; ++pad) {
-        lv_obj_t* c = lv_obj_create(grid);
+        lv_obj_t* c = lv_obj_create(s_root);
         lv_obj_remove_style_all(c);
-        lv_obj_set_grid_cell(c, LV_GRID_ALIGN_STRETCH, pad % 4, 1, LV_GRID_ALIGN_STRETCH, 3 - pad / 4, 1);
+        lv_obj_set_size(c, kCellW, kCellH);
+        place(c, 6 + (pad % 4) * (kCellW + kCellGap),
+              PP_Y(62) + (3 - pad / 4) * (kCellH + kCellGap));
         lv_obj_set_style_bg_color(c, kPanel, 0);
         lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(c, 6, 0);
@@ -1849,6 +2082,7 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
         lv_obj_set_style_border_color(c, kPanel, 0);
         lv_obj_set_style_text_color(c, kText, 0);
         lv_obj_set_style_text_font(c, &lv_font_montserrat_14, 0);
+        lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(c, cell_cb, LV_EVENT_PRESSED, (void*)(intptr_t)pad);
         lv_obj_add_event_cb(c, cell_cb, LV_EVENT_RELEASED, (void*)(intptr_t)pad);
@@ -1857,30 +2091,75 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
         s_cells[pad] = c;
     }
 
-    // -- octave and level --
-    lv_obj_t* bottom = make_row(s_root, kRowH);
-    make_button(bottom, 50, "OCT-", oct_cb, g, (void*)(intptr_t)-1);
-    s_range = lv_label_create(bottom);
-    lv_obj_set_flex_grow(s_range, 1);
-    lv_obj_set_style_text_align(s_range, LV_TEXT_ALIGN_CENTER, 0);
-    make_button(bottom, 50, "OCT+", oct_cb, g, (void*)(intptr_t)1);
-    s_volBtn = lv_CreateEditableButton(bottom);
-    style_button(s_volBtn, 74, kRowH);
+    /* ── the right panel: what is sounding, and out of what ──────────────*/
+    s_noteLbl = lv_label_create(s_root);
+    place(s_noteLbl, 162, PP_Y(63));
+    lv_obj_set_width(s_noteLbl, 152);
+    lv_obj_set_style_text_font(s_noteLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_noteLbl, kText, 0);
+    lv_label_set_long_mode(s_noteLbl, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_noteLbl, "--");
+
+    s_waveBox = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_waveBox);
+    place(s_waveBox, 162, PP_Y(82));
+    lv_obj_set_size(s_waveBox, 152, 58);
+    lv_obj_set_style_radius(s_waveBox, 4, 0);
+    lv_obj_set_style_bg_color(s_waveBox, kWaveBg, 0);
+    lv_obj_set_style_bg_opa(s_waveBox, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_waveBox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_waveBox, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_waveBox, wave_draw_cb, LV_EVENT_DRAW_MAIN_END, nullptr);
+
+    s_envLbl = lv_label_create(s_root);
+    place(s_envLbl, 162, PP_Y(144));
+    lv_obj_set_width(s_envLbl, 152);
+    lv_obj_set_style_text_font(s_envLbl, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_envLbl, kZone0, 0);
+    lv_label_set_long_mode(s_envLbl, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_envLbl, "");
+
+    s_range = lv_label_create(s_root);
+    place(s_range, 162, PP_Y(158));
+    lv_obj_set_width(s_range, 152);
+    lv_obj_set_style_text_font(s_range, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(s_range, kDim, 0);
+    lv_label_set_long_mode(s_range, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_range, "");
+
+    /* The level: turned, because it is set by ear while the pads are played
+     * and a key would need a second one to come back down. */
+    s_volBtn = lv_CreateEditableButton(s_root);
+    style_button(s_volBtn, 152, 22);
+    place(s_volBtn, 162, PP_Y(174));
     lv_obj_add_event_cb(s_volBtn, volume_cb, LV_EVENT_KEY, nullptr);
     lv_obj_add_event_cb(s_volBtn, volume_cb, LV_EVENT_CLICKED, nullptr);
     add_label(s_volBtn, "");
     if (g) lv_group_add_obj(g, s_volBtn);
 
-    s_info = lv_label_create(s_root);
-    lv_obj_set_style_text_font(s_info, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(s_info, kDim, 0);
-    lv_label_set_long_mode(s_info, LV_LABEL_LONG_DOT);
-    lv_obj_set_size(s_info, LV_PCT(100), 12);
+    /* ── soft keys: the five of the design ───────────────────────────────*/
+    {
+        struct { const char* text; lv_event_cb_t cb; void* ud; } keys[5] = {
+            { "SCALE",             scale_cb,  nullptr },
+            { "OCT " LV_SYMBOL_MINUS, oct_cb, (void*)(intptr_t)-1 },
+            { "OCT " LV_SYMBOL_PLUS,  oct_cb, (void*)(intptr_t)1  },
+            { "CHORD",             chord_cb,  nullptr },
+            { "SAMPLE " LV_SYMBOL_RIGHT, sample_cb, nullptr },
+        };
+        for (int i = 0; i < 5; ++i) {
+            lv_obj_t* b = make_button(s_root, 58, keys[i].text, keys[i].cb, g, keys[i].ud);
+            lv_obj_set_height(b, 28);
+            place(b, 6 + i * 62, PP_Y(206));
+        }
+    }
+
+#undef PP_Y
 
     show_pads();
     show_volume();
     show_name();
-    show_info();
+    show_scale_line();
+    show_env();
     request_listing();
 
     // The pads are the instrument's: framework-owned activation (REGISTER_APP_PL).
@@ -1895,7 +2174,9 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     // What it played last time plays again.
     if (s_haveSpec && !s_spec.instrument.zones.empty()) load_spec();
 
-    if (g) lv_group_focus_obj(s_dropdown);
+    /* The instrument first: the first thing a player reaches for here is
+     * which sound, and everything else on the screen is set against it. */
+    if (g && s_nameBtn) lv_group_focus_obj(s_nameBtn);
     s_timer = lv_timer_create(tick_cb, kTickMs, nullptr);
 
     if (app) {
@@ -1952,7 +2233,12 @@ void PitchPlay_destroy(lv_obj_t* root)
     }
     s_prevEncGroup = nullptr;
 #endif
-    s_root = s_dropdown = s_info = s_range = s_volBtn = s_scaleBtn = nullptr;
+    s_root = s_range = s_volBtn = s_scaleBtn = nullptr;
+    s_nameBtn = s_octField = s_chordField = nullptr;
+    s_noteLbl = s_waveBox = s_envLbl = nullptr;
+    s_wave = crosspad::WaveOverview{};
+    s_wavePending = false;
+    s_waveWant.clear();
     for (auto& v : s_scaleVal) v = nullptr;
     for (auto& c : s_cells) c = nullptr;
     lv_obj_delete_async(root);
