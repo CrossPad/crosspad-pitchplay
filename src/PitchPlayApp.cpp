@@ -56,6 +56,9 @@
 #include "crosspad/pad/PadManager.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
 #include "crosspad/sampletools/ISampleTools.hpp"
+#include "crosspad/song/ArrangeFocus.hpp"
+#include "crosspad/song/ISongEngine.hpp"
+#include "crosspad/transport/SequencerTransport.hpp"
 #include "crosspad-gui/components/transport_bar.h"
 #include "crosspad-gui/components/ui_toast.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
@@ -2364,6 +2367,21 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
         app->setOnBack(back_handler);
         app->setOnShow([](lv_obj_t*) {
             if (s_timer) lv_timer_resume(s_timer);
+            /* Opened by Arrange for a Pitch track, this is that track's screen,
+             * as the sequencer's seq view is a kit track's: PLAY, REC and DUB
+             * play the arrangement with the track's scene laid on it, and what
+             * these keys play is recorded into it (every pad hit reaches the
+             * sequencer; its playback presses the pads, and they sound here).
+             * A song already playing keeps playing into it. Opened from MODE
+             * the bar is left to whoever holds it. */
+            const crosspad::ArrangeFocus& f = crosspad::arrangeFocus();
+            if (f.held() && f.seq && f.source == crosspad::SeqSource::Pitch) {
+                if (auto* st = crosspad::sequencerTransport()) {
+                    st->setFollowSong(true);
+                    auto* se = crosspad::getPlatformServices().songEngine;
+                    crosspad::transportClaim(st, !(se && se->playing()));
+                }
+            }
 #ifdef ROM_USE_ENCODER
             if (indev_encoderTop) {
                 lv_group_t* want = s_overlayGroup ? s_overlayGroup : s_encGroup;
