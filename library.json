@@ -1,6 +1,6 @@
 {
   "name": "crosspad-pitchplay",
-  "version": "0.7.0",
+  "version": "0.9.0",
   "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
   "keywords": [
     "crosspad",

@@ -1,7 +1,7 @@
 {
   "name": "Pitch Play",
   "id": "pitchplay",
-  "version": "0.7.0",
+  "version": "0.9.0",
   "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
   "category": "music",
   "icon": "pitchplay.png",
@@ -10,10 +10,12 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=1.55.0",
+    "crosspad-core": ">=1.58.0",
     "crosspad-gui": ">=1.18.0"
   },
   "changelog": [
+    "0.9.0: on an Arrange Pitch track's screen PLAY, REC and DUB are the arrangement's (core 1.58 songTransport()): REC records what these keys play onto the track from Arrange's playhead, as a block of its own notes, the same as REC in Arrange -- it used to play the song from bar one and record into the track's scene. Requires core 1.58.",
+    "0.8.0: on an Arrange Pitch track's screen the first key is SEQ: the track's notes in the sequencer's seq view, whose EDIT comes back here. SCALE stays the field at the top.",
     "0.7.0: opened by Arrange for a Pitch track, this screen is that track's: it takes the transport for the track's scene laid on the song, so PLAY plays the arrangement and REC / DUB record what the keys play. Opened from MODE it is as before.",
     "0.6.0: a held note out of one sample -- EDIT gives each zone a START (the attack, played once) apart from its loop, and XF, a crossfade from the loop's end into what leads up to its start, so the wrap has no seam; LOOP ON now lands past the attack with a quarter of the loop crossfaded. The fifth key is EDIT > and opens the zones directly; SAMPLE > was a second door to the window the instrument's name opens, which keeps the card, the takes and SAVE. EDIT's values -- ROOT, S, E, START, XF -- are fields turned with the encoder (a click starts turning, a click stops; faster the faster it turns) instead of a - and a + beside each. The zone's waveform is drawn again, in the right panel and under the loop in EDIT with the loop, the crossfade and the start marked -- it had been asked of the tools by its logical path, which opens nothing, and asked again every tick. Needs core 1.55 (Zone::start, Zone::loopXfade).",
     "0.5.0: the scale as a shape -- a chromatic octave in the SCALE window, the pitch classes a pad actually sounds lit and the key ringed; and LOOP in EDIT -- start and end per zone, shown as seconds with the region drawn over the sample. Needs core 1.48 (IInstrumentHost::zoneAudio).",

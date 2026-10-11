@@ -58,7 +58,8 @@
 #include "crosspad/sampletools/ISampleTools.hpp"
 #include "crosspad/song/ArrangeFocus.hpp"
 #include "crosspad/song/ISongEngine.hpp"
-#include "crosspad/transport/SequencerTransport.hpp"
+#include "crosspad/transport/SongTransport.hpp"
+#include "crosspad-gui/components/mode_overlay.h"
 #include "crosspad-gui/components/transport_bar.h"
 #include "crosspad-gui/components/ui_toast.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
@@ -2004,6 +2005,22 @@ void build_key_strip()
     show_key_strip();
 }
 
+/// Opened by Arrange for a Pitch track: this screen is that track's.
+bool pitch_track()
+{
+    const crosspad::ArrangeFocus& f = crosspad::arrangeFocus();
+    return f.held() && f.seq && f.source == crosspad::SeqSource::Pitch;
+}
+
+/// SEQ on a Pitch track's screen: the track's notes in the sequencer's seq
+/// view, the piano roll this screen has no room for. The focus is kept, so
+/// that view is the track's and its EDIT comes back here.
+void seq_cb(lv_event_t*)
+{
+    if (s_ov != Overlay::None || !pitch_track()) return;
+    crosspad_gui::mode_overlay_open_app("Sequencer");
+}
+
 void scale_cb(lv_event_t*)
 {
     open_overlay(Overlay::Scale);
@@ -2321,10 +2338,13 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     add_label(s_volBtn, "");
     if (g) lv_group_add_obj(g, s_volBtn);
 
-    /* ── soft keys: the five of the design ───────────────────────────────*/
+    /* ── soft keys: the five of the design ───────────────────────────────
+     * On a Pitch track's screen the first is SEQ, the way to the track's
+     * notes; SCALE is the field at the top as well. */
     {
+        const bool track = pitch_track();
         struct { const char* text; lv_event_cb_t cb; void* ud; } keys[5] = {
-            { "SCALE",             scale_cb,  nullptr },
+            { track ? "SEQ " LV_SYMBOL_RIGHT : "SCALE", track ? seq_cb : scale_cb, nullptr },
             { "OCT " LV_SYMBOL_MINUS, oct_cb, (void*)(intptr_t)-1 },
             { "OCT " LV_SYMBOL_PLUS,  oct_cb, (void*)(intptr_t)1  },
             { "CHORD",             chord_cb,  nullptr },
@@ -2367,20 +2387,15 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
         app->setOnBack(back_handler);
         app->setOnShow([](lv_obj_t*) {
             if (s_timer) lv_timer_resume(s_timer);
-            /* Opened by Arrange for a Pitch track, this is that track's screen,
-             * as the sequencer's seq view is a kit track's: PLAY, REC and DUB
-             * play the arrangement with the track's scene laid on it, and what
-             * these keys play is recorded into it (every pad hit reaches the
-             * sequencer; its playback presses the pads, and they sound here).
-             * A song already playing keeps playing into it. Opened from MODE
-             * the bar is left to whoever holds it. */
-            const crosspad::ArrangeFocus& f = crosspad::arrangeFocus();
-            if (f.held() && f.seq && f.source == crosspad::SeqSource::Pitch) {
-                if (auto* st = crosspad::sequencerTransport()) {
-                    st->setFollowSong(true);
-                    auto* se = crosspad::getPlatformServices().songEngine;
-                    crosspad::transportClaim(st, !(se && se->playing()));
-                }
+            /* Opened by Arrange for a Pitch track, this is that track's screen:
+             * PLAY, REC and DUB are the arrangement's, as in Arrange -- REC
+             * records what these keys play onto the track from the playhead
+             * (every pad hit reaches the sequencer; its playback presses the
+             * pads, and they sound here). A song already playing keeps
+             * playing. Opened from MODE the bar is left to whoever holds it. */
+            if (pitch_track()) {
+                auto* se = crosspad::getPlatformServices().songEngine;
+                crosspad::transportClaim(&crosspad::songTransport(), !(se && se->playing()));
             }
 #ifdef ROM_USE_ENCODER
             if (indev_encoderTop) {
