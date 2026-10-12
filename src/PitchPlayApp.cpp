@@ -2455,7 +2455,7 @@ void PitchPlay_destroy(lv_obj_t* root)
     s_waveWant.clear();
     for (auto& v : s_scaleVal) v = nullptr;
     for (auto& c : s_cells) c = nullptr;
-    lv_obj_delete_async(root);
+    if (root) lv_obj_delete_async(root);
 }
 
 REGISTER_APP_PL(PitchPlay, nullptr, "pitchplay.png",
