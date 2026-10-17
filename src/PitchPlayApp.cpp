@@ -3,7 +3,8 @@
  * @brief Pitch Play -- one sample or many, played chromatically on the pads and
  *        from a MIDI keyboard.
  *
- *   context  the instrument (tap: the sample window), then what the pads are
+ *   context  the instrument (tap: the sample window -- the card, the takes,
+ *            the saved instruments, and SAVE), then what the pads are
  *            set to as plain fields -- the key and scale, the octave, what a
  *            pad makes. No back button: back is the power button's click.
  *   pads     the sixteen pads as they sound, bottom left first: each its
@@ -11,14 +12,17 @@
  *            while it sounds; a touch plays it too
  *   right    the note last played and how hard, the selected zone's waveform,
  *            its envelope, the pads' range, and the level (turned)
- *   keys     SCALE, OCT-, OCT+, CHORD, SAMPLE > -- the five of UX 2000 5.9.
- *            EDIT and SAVE live in the sample window behind SAMPLE >, which
- *            is the one key on the row that leads somewhere.
+ *   keys     SCALE, OCT-, OCT+, CHORD, EDIT > -- EDIT straight into the
+ *            zones, their loops and crossfades. It was SAMPLE >, a second door
+ *            to the window the instrument's name already opens, with EDIT at
+ *            the foot of a list of every take on the card.
  *
  * A sample picked from the list is an instrument of one zone, its pitch
  * detected. EDIT lists the zones -- each a sample and the note it sounds
  * at -- adds one from the card, removes one, sets a root by hand or back to
- * AUTO; leaving EDIT rebuilds the bank. SAVE names the instrument and keeps it
+ * AUTO, where a note begins, and a loop whose end crossfades into what leads
+ * up to its start, so one sample holds for as long as the pad does; leaving
+ * EDIT rebuilds the bank. SAVE names the instrument and keeps it
  * in Pitch Play's library, its samples copied in.
  *
  * The engine is borrowed through crosspad::IInstrumentHost -- the first
@@ -36,6 +40,7 @@
 #endif
 
 #include "crosspad/app/AppRegistrar.hpp"
+#include "crosspad/input/EncoderAccelerator.hpp"
 #include "crosspad/instrument/InstrumentPlayState.hpp"
 #include "crosspad/event/EventData.hpp"
 #include "crosspad/event/IEventBus.hpp"
@@ -51,6 +56,10 @@
 #include "crosspad/pad/PadManager.hpp"
 #include "crosspad/platform/PlatformServices.hpp"
 #include "crosspad/sampletools/ISampleTools.hpp"
+#include "crosspad/song/ArrangeFocus.hpp"
+#include "crosspad/song/ISongEngine.hpp"
+#include "crosspad/transport/SongTransport.hpp"
+#include "crosspad-gui/components/mode_overlay.h"
 #include "crosspad-gui/components/transport_bar.h"
 #include "crosspad-gui/components/ui_toast.h"
 #include "crosspad-gui/widgets/gui_helpers.h"
@@ -144,9 +153,12 @@ lv_obj_t* s_cells[kPads] = {};
 lv_obj_t* s_overlay = nullptr;
 lv_obj_t* s_zoneList = nullptr;
 lv_obj_t* s_rootLabel = nullptr;
-lv_obj_t* s_loopLabel = nullptr;   ///< "0.42 - 1.85 s", or OFF
-lv_obj_t* s_loopFill  = nullptr;   ///< the lit part of the loop bar
+lv_obj_t* s_loopLabel = nullptr;   ///< EDIT: "S 0.42 s", the loop's start
+PP_SLOW_BSS lv_obj_t* s_loopEndLabel;   ///< EDIT: "E 1.85 s"
+lv_obj_t* s_loopWave  = nullptr;   ///< EDIT: the zone's picture, its loop and crossfade marked
 lv_obj_t* s_loopBtn   = nullptr;   ///< ON/OFF for the selected zone's loop
+PP_SLOW_BSS lv_obj_t* s_startLabel;   ///< EDIT: where a note begins
+PP_SLOW_BSS lv_obj_t* s_xfLabel;      ///< EDIT: the loop's crossfade
 PP_SLOW_BSS lv_obj_t* s_keyCell[12];   ///< the scale strip, one per pitch class
 lv_obj_t* s_nameArea = nullptr;
 lv_timer_t* s_timer = nullptr;
@@ -763,13 +775,28 @@ void show_fields()
     }
 }
 
-/// The selected zone's file, or "" when there is none to draw.
+/// The selected zone's file on the card, or "" when there is none to draw.
+///
+/// The tools open what they are given as it stands, and a zone's sample is
+/// logical -- absolute without the card's mount ("/crosspad/..."), or
+/// relative to the instrument's folder. Handed over as it was, it opened
+/// nothing and the box stayed empty. Joined rather than resolved:
+/// resolveKitSamplePath() asks the card which of two layouts a relative
+/// sample is in, and this runs every tick on the UI thread. Pitch Play writes
+/// its instruments flat ("SAMPLES/x.wav" beside the file), the layout that
+/// resolver tries first.
 std::string wave_file()
 {
+    auto* st = tools();
     const auto& zs = s_spec.instrument.zones;
-    if (!s_haveSpec || zs.empty()) return {};
+    if (!st || !s_haveSpec || zs.empty()) return {};
     const int i = (s_zoneSel >= 0 && s_zoneSel < (int)zs.size()) ? s_zoneSel : 0;
-    return zs[(size_t)i].sample;
+    const std::string& s = zs[(size_t)i].sample;
+    if (s.empty()) return {};
+    if (s[0] == '/') return st->cardRoot() + s;
+    const size_t slash = s_spec.path.rfind('/');
+    if (slash == std::string::npos) return {};
+    return st->cardRoot() + s_spec.path.substr(0, slash + 1) + s;
 }
 
 /// Ask the tools for the columns of the zone now selected.
@@ -790,13 +817,11 @@ void request_wave()
 
 /// The zone, drawn as the min/max columns the tools read, in the colour of
 /// the zone it is -- the same colour the pads it plays are underlined in.
-void wave_draw_cb(lv_event_t* e)
+/// Frames [litFrom, litTo) of @p total are in that colour and the rest dim;
+/// litFrom == litTo lights all of it.
+void draw_wave(lv_layer_t* layer, const lv_area_t& a, uint32_t total, uint32_t litFrom, uint32_t litTo)
 {
     if (s_wave.hi.empty() || s_wave.hi.size() != s_wave.lo.size()) return;
-    lv_obj_t* box = lv_event_get_target_obj(e);
-    lv_layer_t* layer = lv_event_get_layer(e);
-    lv_area_t a;
-    lv_obj_get_coords(box, &a);
     const int32_t w = a.x2 - a.x1 + 1, h = a.y2 - a.y1 + 1;
     if (w <= 2 || h <= 4) return;
     const int32_t mid = a.y1 + h / 2, half = h / 2 - 1;
@@ -804,12 +829,14 @@ void wave_draw_cb(lv_event_t* e)
     lv_draw_fill_dsc_t d;
     lv_draw_fill_dsc_init(&d);
     const int zi = (s_zoneSel >= 0) ? s_zoneSel : 0;
-    d.color = lv_color_hex(kZoneRgb[(size_t)zi % kZoneColors]);
+    const lv_color_t lit = lv_color_hex(kZoneRgb[(size_t)zi % kZoneColors]);
     d.opa = LV_OPA_COVER;
     const size_t cols = s_wave.hi.size();
     for (int32_t x = 0; x < w; ++x) {
         const size_t i = (size_t)((uint64_t)x * cols / (uint64_t)w);
         if (i >= cols) break;
+        const uint32_t f = total ? (uint32_t)((uint64_t)x * total / (uint64_t)w) : 0;
+        d.color = (litFrom == litTo || (f >= litFrom && f < litTo)) ? lit : kDim;
         int32_t hi = (int32_t)s_wave.hi[i] * half / 127;
         int32_t lo = (int32_t)s_wave.lo[i] * half / 127;
         if (hi < lo) { const int32_t t = hi; hi = lo; lo = t; }
@@ -817,6 +844,13 @@ void wave_draw_cb(lv_event_t* e)
         const lv_area_t r = {a.x1 + x, mid - hi, a.x1 + x, mid - lo};
         lv_draw_fill(layer, &d, &r);
     }
+}
+
+void wave_draw_cb(lv_event_t* e)
+{
+    lv_area_t a;
+    lv_obj_get_coords(lv_event_get_target_obj(e), &a);
+    draw_wave(lv_event_get_layer(e), a, 0, 0, 0);
 }
 
 // ── the engine ─────────────────────────────────────────────────────────────
@@ -942,7 +976,7 @@ void close_overlay()
     for (auto& c : s_progChip) c = nullptr;
     for (auto& v : s_progVal) v = nullptr;
     s_ov = Overlay::None;
-    s_loopLabel = s_loopFill = s_loopBtn = nullptr;
+    s_loopLabel = s_loopEndLabel = s_loopWave = s_loopBtn = s_startLabel = s_xfLabel = nullptr;
     for (auto& c : s_keyCell) c = nullptr;
 
 }
@@ -1117,16 +1151,41 @@ void show_root()
     lv_label_set_text(s_rootLabel, buf);
 }
 
+/// What zone @p i's row in EDIT says: its number, its root and its file.
+void zone_row_text(size_t i, char* buf, size_t cap)
+{
+    const auto& z = s_spec.instrument.zones[i];
+    char root[8];
+    if (z.root < 0) std::snprintf(root, sizeof(root), "auto");
+    else note_name((int)std::lround(z.root), root, sizeof(root));
+    std::snprintf(buf, cap, "%u  %s   %s", (unsigned)(i + 1), root, base_of(z.sample).c_str());
+}
+
+/// The selected zone's root changed: its row and the ROOT field, in place.
+/// show_zones() rebuilds the list and puts the focus on the zone, which took
+/// it out of the field being turned after a single detent.
+void show_zone_root()
+{
+    if (s_zoneList && s_zoneSel >= 0 && s_zoneSel < (int)s_spec.instrument.zones.size()) {
+        lv_obj_t* row = lv_obj_get_child(s_zoneList, s_zoneSel);
+        lv_obj_t* label = row ? lv_obj_get_child(row, 0) : nullptr;
+        if (label) {
+            char buf[96];
+            zone_row_text((size_t)s_zoneSel, buf, sizeof(buf));
+            lv_label_set_text(label, buf);
+        }
+    }
+    show_root();
+}
+
 void show_zones()
 {
     if (!s_zoneList) return;
     lv_obj_clean(s_zoneList);
     const auto& zones = s_spec.instrument.zones;
     for (size_t i = 0; i < zones.size(); ++i) {
-        char root[8], buf[96];
-        if (zones[i].root < 0) std::snprintf(root, sizeof(root), "auto");
-        else note_name((int)std::lround(zones[i].root), root, sizeof(root));
-        std::snprintf(buf, sizeof(buf), "%u  %s   %s", (unsigned)(i + 1), root, base_of(zones[i].sample).c_str());
+        char buf[96];
+        zone_row_text(i, buf, sizeof(buf));
         lv_obj_t* b = list_item(s_zoneList, buf, zone_cb, (void*)(intptr_t)i);
         lv_obj_set_style_border_side(b, LV_BORDER_SIDE_LEFT, 0);
         lv_obj_set_style_border_width(b, (int)i == s_zoneSel ? 3 : 0, 0);
@@ -1150,7 +1209,7 @@ void root_by(int step)
     const int r = z.root < 0 ? 60 : (int)std::lround(z.root);
     z.root = (float)std::max(0, std::min(127, r + step));
     s_dirty = true;
-    show_zones();
+    show_zone_root();
 }
 
 /* ── the selected zone's loop ──────────────────────────────────────────────
@@ -1170,29 +1229,89 @@ crosspad::IInstrumentHost::ZoneAudio zone_audio()
     return h->zoneAudio((uint8_t)s_zoneSel);
 }
 
+/// The selected zone's length: what the bank made of it, or -- a zone added
+/// in EDIT and not built yet -- its file's, from the picture. 0 = unknown.
+uint32_t zone_frames()
+{
+    const auto za = zone_audio();
+    if (za.frames) return za.frames;
+    if (!s_wave.hi.empty() && s_wave.file == wave_file()) return s_wave.frames;
+    return 0;
+}
+
+/// @p frames as the row shows them: seconds when the rate is known.
+void frames_text(uint32_t frames, char* buf, size_t cap, bool ms = false)
+{
+    const auto za = zone_audio();
+    if (!za.sampleRate) { std::snprintf(buf, cap, "%u fr", (unsigned)frames); return; }
+    const double s = (double)frames / (double)za.sampleRate;
+    if (ms) std::snprintf(buf, cap, "%u ms", (unsigned)std::lround(s * 1000.0));
+    else    std::snprintf(buf, cap, "%.2f s", s);
+}
+
+/// EDIT's picture of the selected zone: the waveform with the loop lit, the
+/// stretch that crossfades shaded at both its ends -- the loop's end, which
+/// fades out, and what leads into the loop start, which fades in -- and a
+/// line where a note begins.
+void loop_wave_draw_cb(lv_event_t* e)
+{
+    const auto& zones = s_spec.instrument.zones;
+    if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
+    const auto& z = zones[s_zoneSel];
+    const uint32_t total = zone_frames();
+    if (!total) return;
+    lv_layer_t* layer = lv_event_get_layer(e);
+    lv_area_t a;
+    lv_obj_get_coords(lv_event_get_target_obj(e), &a);
+    const int32_t w = a.x2 - a.x1 + 1;
+    if (w <= 2) return;
+    auto xOf = [&](uint32_t f) {
+        return a.x1 + (int32_t)((uint64_t)std::min(f, total) * (uint64_t)(w - 1) / total);
+    };
+
+    const bool looping = z.loopEnd > z.loopStart;
+    lv_draw_fill_dsc_t d;
+    lv_draw_fill_dsc_init(&d);
+    d.color = kAccent;
+    if (looping) {
+        const uint32_t xf = crosspad::SampleBank::loopXfadeFor(z.loopStart, z.loopEnd, z.loopXfade);
+        d.opa = LV_OPA_10;
+        const lv_area_t loop = {xOf(z.loopStart), a.y1, xOf(z.loopEnd), a.y2};
+        lv_draw_fill(layer, &d, &loop);
+        if (xf) {
+            d.opa = LV_OPA_30;
+            const lv_area_t out = {xOf(z.loopEnd - xf), a.y1, xOf(z.loopEnd), a.y2};
+            lv_draw_fill(layer, &d, &out);
+            const lv_area_t in = {xOf(z.loopStart - xf), a.y1, xOf(z.loopStart), a.y2};
+            lv_draw_fill(layer, &d, &in);
+        }
+    }
+    if (s_wave.file == wave_file()) {
+        draw_wave(layer, a, total, looping ? z.loopStart : 0, looping ? z.loopEnd : 0);
+    }
+    d.color = kHead;
+    d.opa = LV_OPA_COVER;
+    const int32_t sx = xOf(crosspad::SampleBank::startFor(total, z.loopStart, z.loopEnd, z.start));
+    const lv_area_t mark = {sx, a.y1, sx, a.y2};
+    lv_draw_fill(layer, &d, &mark);
+}
+
 void show_loop()
 {
     const auto& zones = s_spec.instrument.zones;
     const bool have = s_zoneSel >= 0 && s_zoneSel < (int)zones.size();
-    const auto za = zone_audio();
-    if (s_loopLabel) {
-        char buf[48];
-        if (!have) {
-            std::snprintf(buf, sizeof(buf), "--");
-        } else if (!zones[s_zoneSel].loopEnd) {
-            std::snprintf(buf, sizeof(buf), "one-shot");
-        } else if (!za.frames || !za.sampleRate) {
-            /* The points are real and will be used; only their length is not
-             * known yet, so show the frames rather than a wrong time. */
-            std::snprintf(buf, sizeof(buf), "%u-%u fr", (unsigned)zones[s_zoneSel].loopStart,
-                          (unsigned)zones[s_zoneSel].loopEnd);
-        } else {
-            const float sr = (float)za.sampleRate;
-            std::snprintf(buf, sizeof(buf), "%.2f - %.2f s",
-                          (double)(zones[s_zoneSel].loopStart / sr),
-                          (double)(zones[s_zoneSel].loopEnd / sr));
+    if (s_loopLabel && s_loopEndLabel) {
+        /* Seconds, or frames while the length is not known yet: the points
+         * are real and will be used, only a time for them would be wrong. */
+        char s[24] = "S --", e[24] = "E --", t[16];
+        if (have && zones[s_zoneSel].loopEnd) {
+            frames_text(zones[s_zoneSel].loopStart, t, sizeof(t));
+            std::snprintf(s, sizeof(s), "S %s", t);
+            frames_text(zones[s_zoneSel].loopEnd, t, sizeof(t));
+            std::snprintf(e, sizeof(e), "E %s", t);
         }
-        lv_label_set_text(s_loopLabel, buf);
+        lv_label_set_text(s_loopLabel, s);
+        lv_label_set_text(s_loopEndLabel, e);
     }
     if (s_loopBtn) {
         const bool on = have && zones[s_zoneSel].loopEnd != 0;
@@ -1200,30 +1319,34 @@ void show_loop()
         lv_obj_set_style_bg_color(s_loopBtn, on ? kAccent : kPanel, 0);
         lv_obj_set_style_text_color(lv_obj_get_child(s_loopBtn, 0), on ? kInk : kText, 0);
     }
-    if (s_loopFill) {
-        /* The region over the whole sample. Nothing to scale against means
-         * nothing to draw, which is honest. */
-        const bool drawable = have && zones[s_zoneSel].loopEnd && za.frames;
-        lv_obj_set_style_opa(s_loopFill, drawable ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-        if (drawable) {
-            const uint32_t f = za.frames;
-            int x = (int)((uint64_t)zones[s_zoneSel].loopStart * 100 / f);
-            int w = (int)((uint64_t)(zones[s_zoneSel].loopEnd - zones[s_zoneSel].loopStart) * 100 / f);
-            if (w < 1) w = 1;
-            if (x > 99) x = 99;
-            if (x + w > 100) w = 100 - x;
-            lv_obj_set_x(s_loopFill, LV_PCT(x));
-            lv_obj_set_width(s_loopFill, LV_PCT(w));
+    if (s_startLabel) {
+        char buf[24] = "START --", t[16];
+        if (have) {
+            frames_text(zones[s_zoneSel].start, t, sizeof(t));
+            std::snprintf(buf, sizeof(buf), "START %s", t);
         }
+        lv_label_set_text(s_startLabel, buf);
     }
+    if (s_xfLabel) {
+        char buf[24] = "XF --", t[16];
+        if (have && zones[s_zoneSel].loopEnd > zones[s_zoneSel].loopStart) {
+            const auto& z = zones[s_zoneSel];
+            const uint32_t xf = crosspad::SampleBank::loopXfadeFor(z.loopStart, z.loopEnd, z.loopXfade);
+            if (xf) frames_text(xf, t, sizeof(t), true);
+            else    std::snprintf(t, sizeof(t), "off");
+            std::snprintf(buf, sizeof(buf), "XF %s", t);
+        }
+        lv_label_set_text(s_xfLabel, buf);
+    }
+    if (s_loopWave) lv_obj_invalidate(s_loopWave);
 }
 
 /// Two hundred steps across the sample, so one press is a visible move on any
 /// length; a zone whose length is unknown steps by a flat 1000 frames.
 uint32_t loop_step()
 {
-    const auto za = zone_audio();
-    return za.frames ? std::max<uint32_t>(1, za.frames / 200) : 1000u;
+    const uint32_t len = zone_frames();
+    return len ? std::max<uint32_t>(1, len / 200) : 1000u;
 }
 
 /// @p which 0 = start, 1 = end. The two never cross, and the end is what
@@ -1233,8 +1356,7 @@ void loop_by(int which, int dir)
     auto& zones = s_spec.instrument.zones;
     if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
     auto& z = zones[s_zoneSel];
-    const auto za = zone_audio();
-    const uint32_t len = za.frames;                 // 0 = unknown, so unclamped
+    const uint32_t len = zone_frames();             // 0 = unknown, so unclamped
     const int64_t step = (int64_t)loop_step() * dir;
     if (which == 0) {
         int64_t v = (int64_t)z.loopStart + step;
@@ -1244,7 +1366,7 @@ void loop_by(int which, int dir)
         /* From a one-shot, the first + opens a loop over the whole sample
          * rather than a zero-length one at the start, which would be silent. */
         int64_t cur = z.loopEnd ? (int64_t)z.loopEnd : (len ? (int64_t)len : 0);
-        if (!z.loopEnd && dir > 0) { z.loopEnd = (uint32_t)cur; s_dirty = true; show_loop(); show_zones(); return; }
+        if (!z.loopEnd && dir > 0) { z.loopEnd = (uint32_t)cur; s_dirty = true; show_loop(); return; }
         int64_t v = cur + step;
         const int64_t lo = (int64_t)z.loopStart + 1;
         const int64_t hi = len ? (int64_t)len : v;
@@ -1253,7 +1375,6 @@ void loop_by(int which, int dir)
     }
     s_dirty = true;
     show_loop();
-    show_zones();
 }
 
 void loop_toggle_cb(lv_event_t*)
@@ -1264,14 +1385,88 @@ void loop_toggle_cb(lv_event_t*)
     if (z.loopEnd) {
         z.loopEnd = 0;                       // one-shot; the start is kept
     } else {
-        const auto za = zone_audio();
-        z.loopStart = 0;
-        z.loopEnd = za.frames ? za.frames : 0;
-        if (!z.loopEnd) { show_loop(); return; }   // nothing to loop over yet
+        const uint32_t len = zone_frames();
+        if (!len) { show_loop(); return; }   // nothing to loop over yet
+        /* A held note out of one sample, ready to hear: the loop past the
+         * attack and short of the tail, a quarter of it crossfaded. The points
+         * move from there; the note still begins at START. */
+        z.loopStart = len * 3 / 10;
+        z.loopEnd   = len * 9 / 10;
+        z.loopXfade = (z.loopEnd - z.loopStart) / 4;
     }
     s_dirty = true;
     show_loop();
-    show_zones();
+}
+
+/// Where a note begins -- the attack, before the loop -- a step at a time.
+/// Never at or past the loop's end, which it would then never reach.
+void start_by(int dir)
+{
+    auto& zones = s_spec.instrument.zones;
+    if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
+    auto& z = zones[s_zoneSel];
+    const uint32_t len = zone_frames();
+    const int64_t v = (int64_t)z.start + (int64_t)loop_step() * dir;
+    const int64_t hi = z.loopEnd > z.loopStart ? (int64_t)z.loopEnd - 1
+                                               : (len ? (int64_t)len - 1 : v);
+    z.start = (uint32_t)std::max<int64_t>(0, std::min(hi, v));
+    s_dirty = true;
+    show_loop();
+}
+
+/// The loop's crossfade, in twentieths of the most this loop can have: its
+/// own length, or what there is before its start.
+void xf_by(int dir)
+{
+    auto& zones = s_spec.instrument.zones;
+    if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
+    auto& z = zones[s_zoneSel];
+    const uint32_t most = crosspad::SampleBank::loopXfadeFor(z.loopStart, z.loopEnd, UINT32_MAX);
+    if (!most) return;
+    const int64_t step = std::max<int64_t>(1, most / 20);
+    const int64_t cur = std::min<uint32_t>(z.loopXfade, most);
+    z.loopXfade = (uint32_t)std::max<int64_t>(0, std::min<int64_t>(most, cur + step * dir));
+    s_dirty = true;
+    show_loop();
+}
+
+/* EDIT's numbers are turned, not pressed: a click on one -- the knob or a
+ * finger -- starts turning it, the encoder moves it, a click stops. The way
+ * the level is set, and it replaced a - and a + beside every value. */
+enum EditField : int { kFieldRoot, kFieldLoopStart, kFieldLoopEnd, kFieldStart, kFieldXfade };
+
+/* One step a detent is right for a fine move and two hundred detents for a
+ * point to cross the sample, so the frame fields take bigger steps while the
+ * knob turns fast. A semitone stays a semitone. */
+crosspad::EncoderAccelerator s_editAccel;
+
+void edit_field_cb(lv_event_t* e)
+{
+    int step = number_step(e);
+    if (!step) return;
+    const int which = (int)(intptr_t)lv_event_get_user_data(e);
+    if (which != kFieldRoot) step *= s_editAccel.update(1, lv_tick_get());
+    switch (which) {
+        case kFieldRoot:      root_by(step);     break;
+        case kFieldLoopStart: loop_by(0, step);  break;
+        case kFieldLoopEnd:   loop_by(1, step);  break;
+        case kFieldStart:     start_by(step);    break;
+        case kFieldXfade:     xf_by(step);       break;
+        default: break;
+    }
+}
+
+/// A turned field in @p row; @p w 0 shares the row's free width. Returns the
+/// label inside it, which the show_* functions write.
+lv_obj_t* edit_field(lv_obj_t* row, int32_t w, int which)
+{
+    lv_obj_t* b = lv_CreateEditableButton(row);
+    style_button(b, w ? w : 40, kRowH);
+    if (!w) lv_obj_set_flex_grow(b, 1);
+    lv_obj_add_event_cb(b, edit_field_cb, LV_EVENT_KEY, (void*)(intptr_t)which);
+    lv_obj_add_event_cb(b, edit_field_cb, LV_EVENT_CLICKED, (void*)(intptr_t)which);
+    if (s_overlayGroup) lv_group_add_obj(s_overlayGroup, b);
+    return add_label(b, "--");
 }
 
 void open_edit()
@@ -1284,17 +1479,13 @@ void open_edit()
     lv_obj_t* l = lv_label_create(tools);
     lv_obj_set_style_text_color(l, kDim, 0);
     lv_label_set_text(l, "ROOT");
-    make_button(tools, 34, "-", [](lv_event_t*) { root_by(-1); }, s_overlayGroup);
-    s_rootLabel = lv_label_create(tools);
-    lv_obj_set_width(s_rootLabel, 48);
-    lv_obj_set_style_text_align(s_rootLabel, LV_TEXT_ALIGN_CENTER, 0);
-    make_button(tools, 34, "+", [](lv_event_t*) { root_by(1); }, s_overlayGroup);
+    s_rootLabel = edit_field(tools, 0, kFieldRoot);
     make_button(tools, 54, "AUTO", [](lv_event_t*) {
         auto& zones = s_spec.instrument.zones;
         if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
         zones[s_zoneSel].root = -1.0f;
         s_dirty = true;
-        show_zones();
+        show_zone_root();
     }, s_overlayGroup);
     make_button(tools, 48, "DEL", [](lv_event_t*) {
         auto& zones = s_spec.instrument.zones;
@@ -1306,39 +1497,32 @@ void open_edit()
     }, s_overlayGroup);
 
     /* LOOP, under ROOT: the start and the end of the selected zone's loop,
-     * ON/OFF being end = 0 (the one-shot the loader already knows). The bar
-     * under the row is the region over the whole sample -- no waveform, on
-     * purpose: a decoded picture here is the sort of PSRAM a pitched bank
-     * needs, and the numbers plus a region answer "where am I" already. */
+     * ON/OFF being end = 0 (the one-shot the loader already knows). START is
+     * where a note begins and XF how much of the loop's end crossfades into
+     * what leads up to its start, so a held note has no seam. Under them the
+     * zone itself, marked: the same 150 columns the right panel draws --
+     * 300 bytes, not a decoded picture a pitched bank would miss. */
     lv_obj_t* lrow = make_row(s_overlay, kRowH);
     lv_obj_t* ll = lv_label_create(lrow);
     lv_obj_set_style_text_color(ll, kDim, 0);
     lv_label_set_text(ll, "LOOP");
     s_loopBtn = make_button(lrow, 42, "OFF", loop_toggle_cb, s_overlayGroup);
-    make_button(lrow, 28, "S-", [](lv_event_t*) { loop_by(0, -1); }, s_overlayGroup);
-    make_button(lrow, 28, "S+", [](lv_event_t*) { loop_by(0, 1); }, s_overlayGroup);
-    s_loopLabel = lv_label_create(lrow);
-    lv_obj_set_flex_grow(s_loopLabel, 1);
-    lv_obj_set_style_text_align(s_loopLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(s_loopLabel, kAccent, 0);
-    lv_label_set_text(s_loopLabel, "--");
-    make_button(lrow, 28, "E-", [](lv_event_t*) { loop_by(1, -1); }, s_overlayGroup);
-    make_button(lrow, 28, "E+", [](lv_event_t*) { loop_by(1, 1); }, s_overlayGroup);
+    s_loopLabel = edit_field(lrow, 0, kFieldLoopStart);
+    s_loopEndLabel = edit_field(lrow, 0, kFieldLoopEnd);
 
-    lv_obj_t* bar = lv_obj_create(s_overlay);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, LV_PCT(100), 6);
-    lv_obj_set_style_radius(bar, 3, 0);
-    lv_obj_set_style_bg_color(bar, kPanel, 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-    s_loopFill = lv_obj_create(bar);
-    lv_obj_remove_style_all(s_loopFill);
-    lv_obj_set_height(s_loopFill, LV_PCT(100));
-    lv_obj_set_width(s_loopFill, LV_PCT(0));
-    lv_obj_set_style_radius(s_loopFill, 3, 0);
-    lv_obj_set_style_bg_color(s_loopFill, kAccent, 0);
-    lv_obj_set_style_bg_opa(s_loopFill, LV_OPA_TRANSP, 0);
+    lv_obj_t* srow = make_row(s_overlay, kRowH);
+    s_startLabel = edit_field(srow, 0, kFieldStart);
+    s_xfLabel = edit_field(srow, 0, kFieldXfade);
+
+    s_loopWave = lv_obj_create(s_overlay);
+    lv_obj_remove_style_all(s_loopWave);
+    lv_obj_set_size(s_loopWave, LV_PCT(100), 30);
+    lv_obj_set_style_radius(s_loopWave, 4, 0);
+    lv_obj_set_style_bg_color(s_loopWave, kWaveBg, 0);
+    lv_obj_set_style_bg_opa(s_loopWave, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(s_loopWave, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_loopWave, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_loopWave, loop_wave_draw_cb, LV_EVENT_DRAW_MAIN_END, nullptr);
 
     show_zones();
 }
@@ -1362,6 +1546,7 @@ void edit_done()
 
 void edit_cb(lv_event_t*)
 {
+    if (s_ov != Overlay::None) return;
     if (!s_haveSpec) {
         s_spec = crosspad::KitInfo();
         s_spec.name = "New instrument";
@@ -1423,14 +1608,12 @@ void save_cb(lv_event_t*)
     }
 }
 
-// ── SAMPLE > : the one key on the row that leads somewhere ────────────────
+// ── the sample window, behind the instrument's name ───────────────────────
 
 /* The saved instruments, the Recorder's takes and the card -- what the
- * drop-down in the old top row offered -- and with them the two things that
- * make an instrument rather than pick one: EDIT (its zones) and SAVE. The
- * design's key row has five keys and neither EDIT nor SAVE is one of them, so
- * this is where they belong: they are about the sample, and this is the
- * sample window. */
+ * drop-down in the old top row offered -- and SAVE, which keeps what is
+ * playing as one of them. EDIT is a key of its own now: at the foot of this
+ * list it sat under every take on the card, forty to a page. */
 void open_sample_window()
 {
     open_overlay(Overlay::Sample);
@@ -1452,8 +1635,6 @@ void open_sample_window()
         std::snprintf(more, sizeof(more), LV_SYMBOL_DOWN "  %u more ...", (unsigned)(total - end));
         list_item(col, more, sample_pick_cb, (void*)(intptr_t)(SIZE_MAX - 1));
     }
-    list_item(col, LV_SYMBOL_SETTINGS "  Edit the zones ...",
-              [](lv_event_t* e) { close_overlay(); edit_cb(e); }, nullptr);
     list_item(col, LV_SYMBOL_SAVE "  Save as ...",
               [](lv_event_t* e) { close_overlay(); save_cb(e); }, nullptr);
 }
@@ -1824,6 +2005,22 @@ void build_key_strip()
     show_key_strip();
 }
 
+/// Opened by Arrange for a Pitch track: this screen is that track's.
+bool pitch_track()
+{
+    const crosspad::ArrangeFocus& f = crosspad::arrangeFocus();
+    return f.held() && f.seq && f.source == crosspad::SeqSource::Pitch;
+}
+
+/// SEQ on a Pitch track's screen: the track's notes in the sequencer's seq
+/// view, the piano roll this screen has no room for. The focus is kept, so
+/// that view is the track's and its EDIT comes back here.
+void seq_cb(lv_event_t*)
+{
+    if (s_ov != Overlay::None || !pitch_track()) return;
+    crosspad_gui::mode_overlay_open_app("Sequencer");
+}
+
 void scale_cb(lv_event_t*)
 {
     open_overlay(Overlay::Scale);
@@ -1953,9 +2150,13 @@ void take_tools()
              * box drawing somebody else's sample. */
             if (s_wave.file != s_waveWant) s_wave = crosspad::WaveOverview{};
         } else {
+            /* Kept as asked: forgotten, a file that cannot be read was asked
+             * for again every tick, and the tools did nothing else. */
             s_wave = crosspad::WaveOverview{};
+            s_wave.file = s_waveWant;
         }
         if (s_waveBox) lv_obj_invalidate(s_waveBox);
+        if (s_loopWave) lv_obj_invalidate(s_loopWave);
         return;
     }
     if (s_folderPending) {
@@ -2137,14 +2338,17 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     add_label(s_volBtn, "");
     if (g) lv_group_add_obj(g, s_volBtn);
 
-    /* ── soft keys: the five of the design ───────────────────────────────*/
+    /* ── soft keys: the five of the design ───────────────────────────────
+     * On a Pitch track's screen the first is SEQ, the way to the track's
+     * notes; SCALE is the field at the top as well. */
     {
+        const bool track = pitch_track();
         struct { const char* text; lv_event_cb_t cb; void* ud; } keys[5] = {
-            { "SCALE",             scale_cb,  nullptr },
+            { track ? "SEQ " LV_SYMBOL_RIGHT : "SCALE", track ? seq_cb : scale_cb, nullptr },
             { "OCT " LV_SYMBOL_MINUS, oct_cb, (void*)(intptr_t)-1 },
             { "OCT " LV_SYMBOL_PLUS,  oct_cb, (void*)(intptr_t)1  },
             { "CHORD",             chord_cb,  nullptr },
-            { "SAMPLE " LV_SYMBOL_RIGHT, sample_cb, nullptr },
+            { "EDIT " LV_SYMBOL_RIGHT, edit_cb, nullptr },
         };
         for (int i = 0; i < 5; ++i) {
             lv_obj_t* b = make_button(s_root, 58, keys[i].text, keys[i].cb, g, keys[i].ud);
@@ -2183,6 +2387,16 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
         app->setOnBack(back_handler);
         app->setOnShow([](lv_obj_t*) {
             if (s_timer) lv_timer_resume(s_timer);
+            /* Opened by Arrange for a Pitch track, this is that track's screen:
+             * PLAY, REC and DUB are the arrangement's, as in Arrange -- REC
+             * records what these keys play onto the track from the playhead
+             * (every pad hit reaches the sequencer; its playback presses the
+             * pads, and they sound here). A song already playing keeps
+             * playing. Opened from MODE the bar is left to whoever holds it. */
+            if (pitch_track()) {
+                auto* se = crosspad::getPlatformServices().songEngine;
+                crosspad::transportClaim(&crosspad::songTransport(), !(se && se->playing()));
+            }
 #ifdef ROM_USE_ENCODER
             if (indev_encoderTop) {
                 lv_group_t* want = s_overlayGroup ? s_overlayGroup : s_encGroup;
