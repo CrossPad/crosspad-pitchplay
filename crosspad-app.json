@@ -10,11 +10,11 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": "^2.0.0",
-    "crosspad-gui": "^2.0.0"
+    "crosspad-core": ">=1.70.0,<3.0.0",
+    "crosspad-gui": ">=1.28.0,<3.0.0"
   },
   "changelog": [
-    "0.9.1: requires crosspad-core 2.0 and crosspad-gui 2.0 (^2.0.0); a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none)",
+    "0.9.1: builds on core 1.70+/gui 1.28+ and on core/gui 2.x (>=1.70.0,<3.0.0 and >=1.28.0,<3.0.0) for the merge window; a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none)",
     "0.9.0: on an Arrange Pitch track's screen PLAY, REC and DUB are the arrangement's (core 1.58 songTransport()): REC records what these keys play onto the track from Arrange's playhead, as a block of its own notes, the same as REC in Arrange -- it used to play the song from bar one and record into the track's scene. Requires core 1.58.",
     "0.8.0: on an Arrange Pitch track's screen the first key is SEQ: the track's notes in the sequencer's seq view, whose EDIT comes back here. SCALE stays the field at the top.",
     "0.7.0: opened by Arrange for a Pitch track, this screen is that track's: it takes the transport for the track's scene laid on the song, so PLAY plays the arrangement and REC / DUB record what the keys play. Opened from MODE it is as before.",
