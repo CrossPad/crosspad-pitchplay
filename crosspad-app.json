@@ -1,7 +1,7 @@
 {
   "name": "Pitch Play",
   "id": "pitchplay",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
   "category": "music",
   "icon": "pitchplay.png",
@@ -10,10 +10,11 @@
     "esp-idf"
   ],
   "requires": {
-    "crosspad-core": ">=1.70.0,<3.0.0",
-    "crosspad-gui": ">=1.28.0,<3.0.0"
+    "crosspad-core": ">=2.2.0,<3.0.0",
+    "crosspad-gui": ">=2.0.0,<3.0.0"
   },
   "changelog": [
+    "0.10.0: CHORD opens the Chord Designer (core 2.2 crosspad::chords) in place of the chord types, the Diatonic and Types modes and the degree progressions: up to sixteen chords spelled out -- root on C..B and #, maj min 7 maj7 m7 9 m9 13 dim sus4, INV, ADD, DEL, MOVE -- twelve genre presets (FUNK .. POP, INIT), VOICE close/open/wide, and pad n plays chord n in the octave OCT says, the pads past the list silent. A key acts on press and plays the chord for 900 ms; a pad selects the chord it plays; ON/OFF gives the pads back their notes. The list is kept in NVS. A held chord is five notes now (the ninths and the 13). The SCALE window is the key, the scale and the transpose. An instrument the kit browser's PITCH list picks is the one it opens (core instrumentOpenRequest()). Requires core 2.2.",
     "0.9.1: builds on core 1.70+/gui 1.28+ and on core/gui 2.x (>=1.70.0,<3.0.0 and >=1.28.0,<3.0.0) for the merge window; a root deleted before the app's teardown is handled (gui 2.0 calls destroy with none)",
     "0.9.0: on an Arrange Pitch track's screen PLAY, REC and DUB are the arrangement's (core 1.58 songTransport()): REC records what these keys play onto the track from Arrange's playhead, as a block of its own notes, the same as REC in Arrange -- it used to play the song from bar one and record into the track's scene. Requires core 1.58.",
     "0.8.0: on an Arrange Pitch track's screen the first key is SEQ: the track's notes in the sequencer's seq view, whose EDIT comes back here. SCALE stays the field at the top.",

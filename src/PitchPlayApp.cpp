@@ -12,10 +12,12 @@
  *            while it sounds; a touch plays it too
  *   right    the note last played and how hard, the selected zone's waveform,
  *            its envelope, the pads' range, and the level (turned)
- *   keys     SCALE, OCT-, OCT+, CHORD, EDIT > -- EDIT straight into the
- *            zones, their loops and crossfades. It was SAMPLE >, a second door
- *            to the window the instrument's name already opens, with EDIT at
- *            the foot of a list of every take on the card.
+ *   keys     SCALE, OCT-, OCT+, CHORD, EDIT > -- CHORD opens the Chord
+ *            Designer, where up to sixteen chords are spelled out and pad n
+ *            plays chord n; EDIT goes straight into the zones, their loops
+ *            and crossfades. It was SAMPLE >, a second door to the window the
+ *            instrument's name already opens, with EDIT at the foot of a list
+ *            of every take on the card.
  *
  * A sample picked from the list is an instrument of one zone, its pitch
  * detected. EDIT lists the zones -- each a sample and the note it sounds
@@ -48,6 +50,7 @@
 #include "crosspad/instrument/PitchedInstrument.hpp"
 #include "crosspad/kit/IKitManager.hpp"
 #include "crosspad/kit/KitPathUtils.hpp"
+#include "crosspad/music/ChordDesigner.hpp"
 #include "crosspad/music/MusicTheory.hpp"
 #ifdef ESP_PLATFORM
   #include "nvs.h"
@@ -92,7 +95,7 @@ constexpr uint32_t kTickMs   = 50;
  * the only place the shift happens. */
 #define PP_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
 constexpr uint8_t  kPads     = 16;
-constexpr int      kChordMax = 4;    ///< notes in the widest chord a pad makes
+constexpr int      kChordMax = crosspad::chords::kMaxNotes;   ///< notes in the widest chord a pad makes
 
 /* This board boots with under 150 bytes of internal RAM to spare: the 64 kB
  * DMA pool is reserved after the static data is placed, and the first build
@@ -130,7 +133,7 @@ constexpr size_t kZoneColors = sizeof(kZoneRgb) / sizeof(kZoneRgb[0]);
 
 enum class Wait : uint8_t { None, Load, Save };
 enum class Listing : uint8_t { None, Library, Takes };
-enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale, Prog, Sample };
+enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale, Chord, Sample };
 enum class EntryKind : uint8_t { Instrument, Sample, Card };
 
 struct Entry {
@@ -148,9 +151,7 @@ lv_obj_t* s_chordField = nullptr;   ///< context row: "CHORD off"
 lv_obj_t* s_noteLbl  = nullptr;     ///< right panel: "G3 - vel 96"
 lv_obj_t* s_waveBox  = nullptr;     ///< right panel: the selected zone's picture
 lv_obj_t* s_envLbl   = nullptr;     ///< right panel: "ATK 2  REL 40  GLIDE 0"
-PP_SLOW_BSS lv_obj_t* s_scaleVal[4];   ///< the window's four value labels
-PP_SLOW_BSS lv_obj_t* s_progChip[8];    ///< the progression editor's step chips
-PP_SLOW_BSS lv_obj_t* s_progVal[2];     ///< its degree and chord values
+PP_SLOW_BSS lv_obj_t* s_scaleVal[3];   ///< the window's three value labels
 lv_obj_t* s_cells[kPads] = {};
 lv_obj_t* s_overlay = nullptr;
 lv_obj_t* s_zoneList = nullptr;
@@ -214,23 +215,24 @@ int      s_zoneSel = 0;
 
 std::atomic<bool>     s_playable{false};
 std::atomic<uint32_t> s_lit{0};
+std::atomic<uint8_t>  s_padPicked{0};   ///< pad + 1 last struck, for the designer's tick; 0 = none
 /* What a pad struck, so its release stops those notes and not whatever the
- * mapping says now: four 7-bit notes and a 3-bit count in one aligned word,
- * which a single store publishes and a single load reads. */
-PP_SLOW_BSS uint32_t s_padHeld[kPads];
-constexpr uint32_t pack_chord(const uint8_t* n, int count)
+ * mapping says now: five 7-bit notes and a 3-bit count in one word, which a
+ * single store publishes and a single load reads -- the pads and a touch on a
+ * cell come from two tasks. 64 bits since the ninths and the 13 have five
+ * notes; zero (the PSRAM BSS clear) is "nothing held". */
+PP_SLOW_BSS std::atomic<uint64_t> s_padHeld[kPads];
+uint64_t pack_chord(const uint8_t* n, int count)
 {
-    return (uint32_t)count | ((uint32_t)n[0] << 3) | ((uint32_t)n[1] << 10)
-         | ((uint32_t)n[2] << 17) | ((uint32_t)n[3] << 24);
+    uint64_t w = (uint64_t)count;
+    for (int i = 0; i < count && i < kChordMax; ++i) w |= (uint64_t)(n[i] & 0x7F) << (3 + 7 * i);
+    return w;
 }
-inline int unpack_chord(uint32_t w, uint8_t* out)
+inline int unpack_chord(uint64_t w, uint8_t* out)
 {
-    const int count = (int)(w & 7u);
-    out[0] = (uint8_t)((w >> 3) & 0x7F);
-    out[1] = (uint8_t)((w >> 10) & 0x7F);
-    out[2] = (uint8_t)((w >> 17) & 0x7F);
-    out[3] = (uint8_t)((w >> 24) & 0x7F);
-    return count > kChordMax ? kChordMax : count;
+    const int count = std::min((int)(w & 7u), kChordMax);
+    for (int i = 0; i < count; ++i) out[i] = (uint8_t)((w >> (3 + 7 * i)) & 0x7F);
+    return count;
 }
 uint32_t s_drawnLit = 0xFFFFFFFFu;
 
@@ -306,22 +308,22 @@ int zone_for(int note)
 
 // ── key, scale, chords and progressions ───────────────────────────────────
 
-/* All of this is crosspad::MusicTheory's: nine scales, fourteen chord types
- * (Diatonic among them, which takes its quality from the degree), eight
- * progressions and room for eight more of the player's own. It was in core
- * all along with nothing wired to it -- the linker was dropping the whole
- * translation unit. This app is the first thing to ask for it, so the
- * mapping, the chord voicings and the degree-to-quality tables are not
- * repeated here.
+/* The scales are crosspad::MusicTheory's: PlaySettings is the answer, sixteen
+ * pads' notes recomputed by rebuildPadMap() whenever the key, octave or scale
+ * changes, one note a pad. Transpose is ours, applied on top of what it
+ * returns -- a semitone shift of everything, which is what a singer asks
+ * for, and not the same gesture as changing the key.
  *
- * PlaySettings is the answer: sixteen pads' notes and chord notes,
- * recomputed by rebuildPadMap() whenever the key, octave, scale or chord
- * changes. Transpose is ours, applied on top of what it returns -- a
- * semitone shift of everything, which is what a singer asks for, and not the
- * same gesture as changing the key.
+ * Chords are the Chord Designer's (core crosspad::chords, CHORD on the keys):
+ * a list of up to sixteen chords spelled out -- root, quality, inversion --
+ * and, while it is on, pad n plays chord n in the octave OCT says, voiced the
+ * way the list says, shifted by the transpose; pads past its end are silent.
+ * It replaces what this app had -- a chord type on every pad, the Diatonic and
+ * Types modes, progressions of scale degrees -- because a genre's chords are
+ * a record of particular chords, not degrees of whatever key is set.
  *
- * In PSRAM, all of it: PlaySettings is ~150 bytes and the custom
- * progressions another ~400, and this board aborts at boot over 144. */
+ * In PSRAM, all of it: this board aborts at boot over 144 bytes more of
+ * internal RAM. */
 
 PP_SLOW_BSS crosspad::MusicTheory  s_mt;
 PP_SLOW_BSS crosspad::PlaySettings s_ps;
@@ -330,26 +332,56 @@ PP_SLOW_BSS int s_oct;          ///< PlaySettings octave, -2..+4
 constexpr int kOctDefault = 1;  ///< MusicTheory's base is (3+oct)*12, so 1 puts pad 1 on C3,
                                 ///< where this app has always started
 PP_SLOW_BSS int s_scale;        ///< index into MusicTheory's scales
-PP_SLOW_BSS int s_chordIdx;     ///< 0..11 a chord type, 12 Diatonic, 13 Types, 14+ a progression
 PP_SLOW_BSS int s_transpose;    ///< semitones, -12..+12, on top of all of it
 
+PP_SLOW_BSS crosspad::chords::Progression s_prog;   ///< the Chord Designer's list
+PP_SLOW_BSS bool s_chordsOn;    ///< the pads play its chords rather than the scale
+PP_SLOW_BSS bool s_progDirty;   ///< changed since it was last stored
+
+/// The C a chord counts from: the octave pad 1 is in, so a chord of the key
+/// sits where the key's own note does.
+int chord_octave() { return s_oct + 2; }
 
 int clamp_note(int n) { return n < 0 ? 0 : (n > 127 ? 127 : n); }
+
+/// "FUNK", "FUNK*" once edited, "USER" for one of the player's own.
+void prog_label(char* buf, size_t n)
+{
+    std::snprintf(buf, n, "%s%s", crosspad::chords::presetName(s_prog.preset), s_prog.edited ? "*" : "");
+}
 
 /* Pitch Play is the only writer of the shared state (core's
  * InstrumentPlayState): the Sequencer recording an instrument and the
  * Recorder bouncing one have to sound like these pads do, and they only can
  * if they read this instead of keeping a copy of the key, the scale and the
- * chord. Published from the two places the state can change -- the map here,
+ * chords. Published from the two places the state can change -- the map here,
  * the instrument when a load lands. */
 void publish_play_state()
 {
     auto& st = crosspad::instrumentPlayState();
-    st.play = s_ps;                  // rebuildPadMap() has already run on it
-    const char* cn = s_mt.chordName((uint8_t)s_chordIdx);
-    st.chordName = cn ? cn : "";     // named here: only this MusicTheory knows
-                                     // the player's own progressions
+    st.play = s_ps;                  // rebuildPadMap() and the chords are already on it
+    if (s_chordsOn) {
+        char b[16];
+        prog_label(b, sizeof(b));
+        st.chordName = b;
+    } else {
+        const char* cn = s_mt.chordName(0);
+        st.chordName = cn ? cn : "";
+    }
     crosspad::instrumentPlayStatePublished();
+}
+
+/// The list onto the pads: chord n's notes on pad n, the rest silent.
+void put_chords()
+{
+    for (uint8_t pad = 0; pad < kPads; ++pad) {
+        uint8_t notes[crosspad::chords::kMaxNotes] = {};
+        const uint8_t n = pad < s_prog.count
+            ? crosspad::chords::notes(s_prog.chords[pad], chord_octave(), s_prog.voicing, notes) : 0;
+        for (int c = 0; c < 6; ++c) s_ps.padChordNotes[pad][c] = c < n ? notes[c] : 0xFF;
+        s_ps.padChordCount[pad] = n;
+        if (!n) s_ps.padSilent = (uint16_t)(s_ps.padSilent | (1u << pad));
+    }
 }
 
 void rebuild_pads()
@@ -357,8 +389,9 @@ void rebuild_pads()
     s_ps.rootNote   = (uint8_t)s_key;
     s_ps.octave     = (int8_t)s_oct;
     s_ps.scaleIndex = (uint8_t)s_scale;
-    s_ps.chordIndex = (uint8_t)s_chordIdx;
+    s_ps.chordIndex = 0;             // one note a pad; chords come from the list
     s_mt.rebuildPadMap(s_ps);
+    if (s_chordsOn) put_chords();
     if (s_transpose == 0) { publish_play_state(); return; }
     for (int pad = 0; pad < kPads; ++pad) {
         s_ps.padMidiMap[pad] = (uint8_t)clamp_note(s_ps.padMidiMap[pad] + s_transpose);
@@ -378,10 +411,11 @@ int pad_of_note(int note)
     return -1;
 }
 
-/// The notes a press on @p pad makes, into @p out. Always at least one.
+/// The notes a press on @p pad makes, into @p out: none on a silent pad, its
+/// own note when it has no chord.
 int chord_of(uint8_t pad, uint8_t* out)
 {
-    if (pad >= kPads) { out[0] = 0; return 1; }
+    if (pad >= kPads || (s_ps.padSilent & (1u << pad))) return 0;
     int n = 0;
     const int have = s_ps.padChordCount[pad];
     for (int c = 0; c < have && c < 6 && n < kChordMax; ++c) {
@@ -392,91 +426,60 @@ int chord_of(uint8_t pad, uint8_t* out)
     return n;
 }
 
-/* The player's own progressions.
- *
- * MusicTheory holds up to eight and plays them, but it has no way to read
- * one back, so this keeps the copies: they are what the editor edits, what
- * NVS stores and what is handed back to MusicTheory on every start. A
- * progression is steps of (degree, chord type) -- degrees of whatever scale
- * is current, so the same progression follows a key or a mode change. */
+/* The list is kept across a reboot: one blob in Pitch Play's NVS namespace,
+ * written when the designer closes (not on every tap -- flash wears) and when
+ * the app does. A blob that is not exactly this, or does not pass valid(),
+ * is the first preset instead. The degree progressions this app used to keep
+ * ("progs") are left where they are: nothing here plays them any more. */
+constexpr const char* kNvsNs  = "pitchplay";
+constexpr const char* kNvsKey = "chords";
+constexpr uint8_t kChordsBlobVersion = 1;
 
-constexpr int kMaxCustom = crosspad::MusicTheory::MAX_CUSTOM_PROGS;
-constexpr int kMaxSteps  = 8;      ///< of MusicTheory's sixteen; eight fits the screen
-
-struct CustomProgression {
-    char              name[12];
-    crosspad::ProgStep steps[kMaxSteps];
-    uint8_t           count;
+struct StoredChords {
+    uint8_t version;
+    uint8_t on;
+    crosspad::chords::Progression prog;
 };
 
-PP_SLOW_BSS CustomProgression s_custom[kMaxCustom];
-PP_SLOW_BSS int s_customN;
-PP_SLOW_BSS int s_editSlot;        ///< which of them the editor is on
-PP_SLOW_BSS int s_editSel;         ///< which step is being changed
-PP_SLOW_BSS CustomProgression s_edit;   ///< the working copy, so Back discards
-
-constexpr const char* kNvsNs  = "pitchplay";
-constexpr const char* kNvsKey = "progs";
-
-/// Hand every stored progression back to MusicTheory, in slot order.
-void register_customs()
+void save_chords()
 {
-    s_mt.clearCustomProgressions();
-    for (int i = 0; i < s_customN; ++i) {
-        s_mt.addCustomProgression(s_custom[i].name, s_custom[i].steps, s_custom[i].count);
-    }
-}
-
-/// The chord index that plays custom progression @p slot.
-int custom_chord_index(int slot)
-{
-    return crosspad::MusicTheory::CHORD_PROG_START_IDX
-         + (int)crosspad::MusicTheory::builtinProgCount() + slot;
-}
-
-void save_customs()
-{
+    if (!s_progDirty) return;
+    s_progDirty = false;
 #ifdef ESP_PLATFORM
+    StoredChords b = {kChordsBlobVersion, (uint8_t)(s_chordsOn ? 1 : 0), s_prog};
     nvs_handle_t h;
     if (nvs_open(kNvsNs, NVS_READWRITE, &h) != ESP_OK) return;
-    const uint8_t n = (uint8_t)s_customN;
-    nvs_set_u8(h, "n", n);
-    if (n) nvs_set_blob(h, kNvsKey, s_custom, sizeof(CustomProgression) * n);
+    nvs_set_blob(h, kNvsKey, &b, sizeof(b));
     nvs_commit(h);
     nvs_close(h);
 #endif
 }
 
-void load_customs()
+void load_chords()
 {
+    crosspad::chords::init(s_prog);
+    s_chordsOn = false;
+    s_progDirty = false;
 #ifdef ESP_PLATFORM
     nvs_handle_t h;
     if (nvs_open(kNvsNs, NVS_READONLY, &h) != ESP_OK) return;
-    uint8_t n = 0;
-    if (nvs_get_u8(h, "n", &n) == ESP_OK && n > 0 && n <= kMaxCustom) {
-        size_t len = sizeof(CustomProgression) * n;
-        if (nvs_get_blob(h, kNvsKey, s_custom, &len) == ESP_OK) s_customN = n;
+    StoredChords b;
+    size_t len = sizeof(b);
+    if (nvs_get_blob(h, kNvsKey, &b, &len) == ESP_OK && len == sizeof(b) &&
+        b.version == kChordsBlobVersion && crosspad::chords::valid(b.prog)) {
+        s_prog = b.prog;
+        s_chordsOn = b.on != 0;
     }
     nvs_close(h);
 #endif
-    register_customs();
 }
 
-/// "C", "Am", "G7" -- the pad's root and the quality its chord was built with.
+/// "Em7" -- the chord pad @p pad plays, or "" past the end of the list.
 void pad_chord_name(uint8_t pad, char* buf, size_t len)
 {
-    if (pad >= kPads) { std::snprintf(buf, len, "--"); return; }
-    const int note = s_ps.padMidiMap[pad];
-    const uint8_t q = s_ps.padChordTypeIdx[pad];
-    const char qc = crosspad::MusicTheory::chordQualChar(q);
-    const char* root = pitch_name(note, s_key);
-    if (qc && qc != ' ') std::snprintf(buf, len, "%s%c", root, qc);
-    else                 std::snprintf(buf, len, "%s", root);
+    if (pad >= s_prog.count) { if (len) buf[0] = '\0'; return; }
+    crosspad::chords::shortName(s_prog.chords[pad], buf, len);
 }
-
-/// True while a pad sounds more than its own note.
-bool pads_are_chords() { return s_ps.padChordCount[0] > 1; }
-
 
 uint8_t pad_note(uint8_t pad) { return pad < kPads ? s_ps.padMidiMap[pad] : 0; }
 
@@ -541,17 +544,18 @@ public:
          * right notes after OCT, the key or the chord itself has moved. */
         uint8_t notes[kChordMax] = {};
         const int n = chord_of(pad, notes);
-        s_padHeld[pad] = pack_chord(notes, n);
+        s_padHeld[pad].store(pack_chord(notes, n));
+        if (!n) return;                        // past the end of the chord list
         for (int i = 0; i < n; ++i) play_one(notes[i], vel, pad);
         light_on(pad, vel);
+        s_padPicked.store((uint8_t)(pad + 1));  // the designer selects what was played
     }
     void onPadRelease(crosspad::PadManager& pm, uint8_t pad) override
     {
         if (pad >= kPads) return;
         auto* p = inst();
         uint8_t notes[kChordMax];
-        const int n = unpack_chord(s_padHeld[pad], notes);
-        s_padHeld[pad] = 0;
+        const int n = unpack_chord(s_padHeld[pad].exchange(0), notes);
         for (int i = 0; i < n; ++i) if (p) p->noteOff(notes[i]);
         light_off(pad);
         pm.notifyNoteOff(pad, true);
@@ -654,17 +658,28 @@ int number_step(lv_event_t* e)
 void show_scale_line();
 void show_key_strip();     // the chromatic strip in the SCALE window
 
+/// The lowest note @p pad sounds -- its own, or its chord's -- or -1 when silent.
+int sound_note(uint8_t pad)
+{
+    if (pad >= kPads || (s_ps.padSilent & (1u << pad))) return -1;
+    return s_chordsOn && s_ps.padChordCount[pad] ? s_ps.padChordNotes[pad][0] : pad_note(pad);
+}
+
 void show_pads()
 {
     char name[8];
     for (uint8_t pad = 0; pad < kPads; ++pad) {
         lv_obj_t* c = s_cells[pad];
         if (!c) continue;
-        const int note = pad_note(pad);
-        if (pads_are_chords()) pad_chord_name(pad, name, sizeof(name));
-        else                   note_name(note, name, sizeof(name));
-        lv_label_set_text(lv_obj_get_child(c, 0), name);
-        const int z = s_haveSpec ? zone_for(note) : -1;
+        const int note = sound_note(pad);
+        if (s_chordsOn) pad_chord_name(pad, name, sizeof(name));
+        else            note_name(note, name, sizeof(name));
+        lv_obj_t* l = lv_obj_get_child(c, 0);
+        lv_label_set_text(l, name);
+        /* "C#maj7" is wider than a 36 px cell in 14 px type. */
+        lv_obj_set_style_text_font(l, std::strlen(name) > 4 ? &lv_font_montserrat_10
+                                                             : &lv_font_montserrat_14, 0);
+        const int z = s_haveSpec && note >= 0 ? zone_for(note) : -1;
         lv_obj_set_style_border_color(c, z >= 0 ? lv_color_hex(kZoneRgb[z % kZoneColors]) : kPanel, 0);
     }
     if (s_range) {
@@ -678,10 +693,30 @@ void show_pads()
     s_drawnLit = 0xFFFFFFFFu;   // redrawn on the next tick
 }
 
+/* The chord list's colours on the pads, as the designer draws its strip:
+ * a chord in dim purple, the selected one lime, purple while it sounds, and
+ * nothing past the end of the list. */
+constexpr uint32_t kChordRgb    = 0x3B2A5E;
+constexpr uint32_t kChordSelRgb = 0xC6FF47;
+constexpr uint32_t kChordHitRgb = 0xA77BF0;
+
+crosspad::RgbColor rgb_of(uint32_t rgb)
+{
+    return crosspad::RgbColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+}
+
 /// The pads' LEDs in their zones' colours: dim at rest, full while hit.
 void show_leds()
 {
     auto& leds = crosspad::getPadLedController();
+    if (s_chordsOn) {
+        for (uint8_t pad = 0; pad < kPads; ++pad) {
+            const bool used = pad < s_prog.count;
+            leds.setPadColor(pad, rgb_of(!used ? 0 : pad == s_prog.selected ? kChordSelRgb : kChordRgb));
+            leds.setPadPressedColor(pad, rgb_of(used ? kChordHitRgb : 0));
+        }
+        return;
+    }
     for (uint8_t pad = 0; pad < kPads; ++pad) {
         const int z = s_haveSpec ? zone_for(pad_note(pad)) : -1;
         const uint32_t rgb = z >= 0 ? kZoneRgb[z % kZoneColors] : 0x202020;
@@ -771,8 +806,8 @@ void show_fields()
         lv_label_set_text(s_octField, buf);
     }
     if (s_chordField) {
-        const char* cn = s_mt.chordName((uint8_t)s_chordIdx);
-        std::snprintf(buf, sizeof(buf), "%.10s", (pads_are_chords() && cn) ? cn : "CHORD off");
+        if (s_chordsOn) prog_label(buf, sizeof(buf));
+        else            std::snprintf(buf, sizeof(buf), "CHORD off");
         lv_label_set_text(s_chordField, buf);
     }
 }
@@ -965,9 +1000,12 @@ void sample_pick_cb(lv_event_t* e)
 
 // ── overlays ───────────────────────────────────────────────────────────────
 
+void cd_close();
+
 void close_overlay()
 {
     if (!s_overlay) return;
+    if (s_ov == Overlay::Chord) cd_close();
 #ifdef ROM_USE_ENCODER
     if (indev_encoderTop && s_encGroup) lv_indev_set_group(indev_encoderTop, s_encGroup);
     lv_group_delete_deferred(s_overlayGroup);     // the click that closed it is still being read
@@ -976,8 +1014,6 @@ void close_overlay()
     lv_obj_delete_async(s_overlay);
     s_overlay = s_zoneList = s_rootLabel = s_nameArea = nullptr;
     for (auto& v : s_scaleVal) v = nullptr;   // children of the overlay, gone with it
-    for (auto& c : s_progChip) c = nullptr;
-    for (auto& v : s_progVal) v = nullptr;
     s_ov = Overlay::None;
     s_loopLabel = s_loopEndLabel = s_loopWave = s_loopBtn = s_startLabel = s_xfLabel = nullptr;
     for (auto& c : s_keyCell) c = nullptr;
@@ -1649,10 +1685,10 @@ void sample_cb(lv_event_t*)
     open_sample_window();
 }
 
-/// CHORD: the next of what a pad makes. The field in the context row says
-/// which; SCALE is where the rest of the mapping is set.
-void step_chord(int d);
-void chord_cb(lv_event_t*) { step_chord(+1); }
+/// CHORD: the Chord Designer. The field in the context row says what the
+/// pads play; SCALE is where the rest of the mapping is set.
+void chord_open();
+void chord_cb(lv_event_t*) { chord_open(); }
 
 // ── the mapping ────────────────────────────────────────────────────────────
 
@@ -1663,16 +1699,16 @@ void chord_cb(lv_event_t*) { step_chord(+1); }
 /* Sixteen degrees of a scale span more than sixteen semitones, so the top
  * pad is what has to stay a note, so the setting is tried on the real map
  * and rolled back when the top of it has been clamped away. */
-bool set_mapping(int oct, int key, int scale, int transpose, int chordIdx)
+bool set_mapping(int oct, int key, int scale, int transpose)
 {
-    const int wasO = s_oct, wasK = s_key, wasS = s_scale, wasT = s_transpose, wasC = s_chordIdx;
+    const int wasO = s_oct, wasK = s_key, wasS = s_scale, wasT = s_transpose;
     if (oct < -2 || oct > 4 || transpose < -12 || transpose > 12) return false;
-    s_oct = oct; s_key = key; s_scale = scale; s_transpose = transpose; s_chordIdx = chordIdx;
+    s_oct = oct; s_key = key; s_scale = scale; s_transpose = transpose;
     rebuild_pads();
     /* The map is clamped to 0..127, so a setting that runs off the top shows
      * as the last pads landing on the same note. Refuse it and go back. */
     if (s_ps.padMidiMap[kPads - 1] == s_ps.padMidiMap[kPads - 2]) {
-        s_oct = wasO; s_key = wasK; s_scale = wasS; s_transpose = wasT; s_chordIdx = wasC;
+        s_oct = wasO; s_key = wasK; s_scale = wasS; s_transpose = wasT;
         rebuild_pads();
         return false;
     }
@@ -1684,7 +1720,7 @@ bool set_mapping(int oct, int key, int scale, int transpose, int chordIdx)
 void oct_cb(lv_event_t* e)
 {
     const int step = (int)(intptr_t)lv_event_get_user_data(e);
-    set_mapping(s_oct + step, s_key, s_scale, s_transpose, s_chordIdx);
+    set_mapping(s_oct + step, s_key, s_scale, s_transpose);
 }
 
 void volume_cb(lv_event_t* e)
@@ -1714,7 +1750,7 @@ void show_scale_line()
          * surprise. */
         const char* sc = crosspad::MusicTheory::scaleName((uint8_t)s_scale);
         std::snprintf(buf, sizeof(buf), "%s %.3s%s", key_name(s_key), sc ? sc : "?",
-                      pads_are_chords() ? "." : "");
+                      s_chordsOn ? "." : "");
         lv_label_set_text(lv_obj_get_child(s_scaleBtn, 0), buf);
     }
     if (!s_scaleVal[0]) return;
@@ -1724,33 +1760,10 @@ void show_scale_line()
     lv_label_set_text(s_scaleVal[1], sc ? sc : "?");
     std::snprintf(buf, sizeof(buf), "%+d", s_transpose);
     lv_label_set_text(s_scaleVal[2], buf);
-    lv_label_set_text(s_scaleVal[3], s_mt.chordName((uint8_t)s_chordIdx));
     show_key_strip();        // the picture and the names are one thing
 }
 
-/// The next (or previous) of what a pad can make: one note, the chord types,
-/// the two modes, then the progressions. Its own function because the CHORD
-/// key on the soft row steps it as well as the SCALE window's row.
-void step_chord(int d)
-{
-    const int chords = (int)s_mt.totalChordCount();
-    if (chords <= 0) return;
-    /* A progression is degrees, so it is written in a mode: picking one
-     * brings its scale with it, or "Backdoor" would have no flat seventh to
-     * walk down and "Lydian Dream" no major II. The twelve chord types and
-     * the two modes leave the scale alone, and so do the player's own
-     * progressions -- nothing knows what key those were meant in. */
-    const int next = (s_chordIdx + chords + d) % chords;
-    const int first = crosspad::MusicTheory::CHORD_PROG_START_IDX;
-    const int builtins = (int)crosspad::MusicTheory::builtinProgCount();
-    int scale = s_scale;
-    if (next >= first && next < first + builtins) {
-        scale = (int)crosspad::MusicTheory::builtinProgScale((uint8_t)(next - first));
-    }
-    set_mapping(s_oct, s_key, scale, s_transpose, next);
-}
-
-/// -1 or +1 on one of the four, from the button's user data: (which << 1) | up.
+/// -1 or +1 on one of the three, from the button's user data: (which << 1) | up.
 void scale_step_cb(lv_event_t* e)
 {
     const int code = (int)(intptr_t)lv_event_get_user_data(e);
@@ -1758,10 +1771,9 @@ void scale_step_cb(lv_event_t* e)
     const int d = (code & 1) ? 1 : -1;
     const int scales = (int)crosspad::MusicTheory::scaleCount();
     switch (which) {
-        case 0: set_mapping(s_oct, (s_key + 12 + d) % 12, s_scale, s_transpose, s_chordIdx); break;
-        case 1: set_mapping(s_oct, s_key, (s_scale + scales + d) % scales, s_transpose, s_chordIdx); break;
-        case 2: set_mapping(s_oct, s_key, s_scale, s_transpose + d, s_chordIdx); break;
-        default: step_chord(d); break;
+        case 0: set_mapping(s_oct, (s_key + 12 + d) % 12, s_scale, s_transpose); break;
+        case 1: set_mapping(s_oct, s_key, (s_scale + scales + d) % scales, s_transpose); break;
+        default: set_mapping(s_oct, s_key, s_scale, s_transpose + d); break;
     }
 }
 
@@ -1784,166 +1796,388 @@ lv_obj_t* scale_row(const char* name, int which)
     return r;
 }
 
-/* The editor. One row of chips -- the steps -- then the two things a step
- * is: its degree of the scale and the chord built on it. Eight steps fit the
- * row; MusicTheory would take sixteen. */
+/* ── CHORD: the Chord Designer (UX 2000) ─────────────────────────────────
+ *
+ * The screen under the transport bar, laid out the way the design draws it
+ * (LVGL PROTO/lvgl_chord), in its own coordinates:
+ *   context  the preset (a tap: the twelve), OCT, VOICE, CHORD ON/OFF
+ *   strip    the chords eight at a time and a page key for the next eight;
+ *            the selected one ringed lime, a "+" after the last
+ *   roots    C D E F G A B and #
+ *   types    maj min 7 maj7 m7 / 9 m9 13 dim sus4
+ *   keys     INV n, ADD, DEL, < MOVE, MOVE >
+ * A key acts on press, as a pad does, and an edit plays the selected chord
+ * for 900 ms, so it is heard as it is made. A pad selects the chord it plays.
+ * OCT is the pads' octave, the one OCT- / OCT+ move; opening the designer
+ * puts the chords on the pads, and ON/OFF takes them off again. Back (the
+ * power button's click) closes the presets, then the designer, which stores
+ * the list. The encoder walks the keys, as everywhere. No BARS and no
+ * playback: the pads play the chords, the transport does not. */
 
-void prog_show()
+enum ChordAct : uint8_t { A_PRESET, A_OCT, A_VOICE, A_ON, A_SLOT, A_PAGE, A_ROOT, A_SHARP, A_TYPE, A_SK, A_LOAD };
+
+constexpr int kStripSlots = 8;
+constexpr uint32_t kAuditionMs = 900;
+constexpr uint8_t kNatural[7] = {0, 2, 4, 5, 7, 9, 11};
+const lv_color_t kPress = lv_color_hex(0x2C3138);
+const lv_color_t kWell  = lv_color_hex(0x1B1E22);
+const lv_color_t kMint  = lv_color_hex(0x00FF88);
+
+/// Children of the overlay: gone with it, so dropped in close_overlay().
+struct ChordView {
+    lv_obj_t* preset;
+    lv_obj_t* presetL;
+    lv_obj_t* octV;
+    lv_obj_t* voiceV;
+    lv_obj_t* onKey;
+    lv_obj_t* onV;
+    lv_obj_t* pick;                  ///< strip, roots and types: hidden under the presets
+    lv_obj_t* slot[kStripSlots];
+    lv_obj_t* slotR[kStripSlots];
+    lv_obj_t* slotQ[kStripSlots];
+    lv_obj_t* slotBar[kStripSlots];  ///< the chord sounding, along the top
+    lv_obj_t* page1;
+    lv_obj_t* page2;
+    lv_obj_t* root[7];
+    lv_obj_t* sharp;
+    lv_obj_t* type[crosspad::chords::QualityCount];
+    lv_obj_t* invL;
+    lv_obj_t* presets;
+    lv_obj_t* presetKey[16];
+    lv_timer_t* audition;
+    uint8_t page;
+    uint32_t drawnLit;
+};
+PP_SLOW_BSS ChordView s_cv;
+PP_SLOW_BSS uint64_t s_auditionHeld;   ///< the audition's notes, packed as a pad's are
+PP_SLOW_BSS uint8_t  s_auditionPad;    ///< and the pad it lit
+
+lv_obj_t* cd_box(lv_obj_t* p, int32_t x, int32_t y, int32_t w, int32_t h, lv_color_t c)
 {
-    for (int i = 0; i < kMaxSteps; ++i) {
-        if (!s_progChip[i]) continue;
-        const bool used = i < s_edit.count;
-        lv_obj_set_style_bg_color(s_progChip[i], i == s_editSel ? kAccent : kPanel, 0);
-        lv_obj_set_style_text_color(lv_obj_get_child(s_progChip[i], 0),
-                                    i == s_editSel ? kInk : (used ? kText : kDim), 0);
-        char b[8];
-        if (used) {
-            const char qc = crosspad::MusicTheory::chordQualChar(s_edit.steps[i].chordType);
-            std::snprintf(b, sizeof(b), "%d%c", s_edit.steps[i].degree + 1, qc ? qc : ' ');
+    lv_obj_t* o = lv_obj_create(p);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_style_radius(o, 4, 0);
+    lv_obj_set_style_bg_color(o, c, 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    return o;
+}
+
+/// A label; one in the dim colour is marked so cd_on() gives it back its dim.
+lv_obj_t* cd_text(lv_obj_t* p, const lv_font_t* f, lv_color_t c, const char* t)
+{
+    lv_obj_t* l = lv_label_create(p);
+    lv_obj_set_style_text_font(l, f, 0);
+    lv_obj_set_style_text_color(l, c, 0);
+    lv_label_set_text(l, t);
+    if (lv_color_eq(c, kDim)) lv_obj_set_user_data(l, (void*)1);
+    return l;
+}
+
+void cd_ev(lv_event_t* e);
+
+lv_obj_t* cd_key(lv_obj_t* p, int32_t x, int32_t y, int32_t w, int32_t h, int act, int arg)
+{
+    lv_obj_t* b = cd_box(p, x, y, w, h, kPanel);
+    lv_obj_set_style_bg_color(b, kPress, LV_STATE_PRESSED);
+    lv_obj_set_style_outline_color(b, kHead, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(b, 2, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_pad(b, 1, LV_STATE_FOCUS_KEY);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(b, cd_ev, LV_EVENT_PRESSED, (void*)(intptr_t)((arg << 8) | act));
+    if (s_overlayGroup) lv_group_add_obj(s_overlayGroup, b);
+    return b;
+}
+
+/// A key with a dim name and a value: "OCT 3". Returns the value.
+lv_obj_t* cd_field(int32_t x, int32_t w, const char* name, int act, lv_obj_t** key = nullptr)
+{
+    lv_obj_t* b = cd_key(s_overlay, x, 4, w, 22, act, 0);
+    lv_obj_set_flex_flow(b, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(b, 5, 0);
+    cd_text(b, &lv_font_montserrat_10, kDim, name);
+    if (key) *key = b;
+    return cd_text(b, &lv_font_montserrat_14, kText, "");
+}
+
+/// Lime with ink letters when on, the panel when not.
+void cd_on(lv_obj_t* b, bool on)
+{
+    lv_obj_set_style_bg_color(b, on ? kAccent : kPanel, 0);
+    const uint32_t n = lv_obj_get_child_count(b);
+    for (uint32_t i = 0; i < n; ++i) {
+        lv_obj_t* c = lv_obj_get_child(b, (int32_t)i);
+        if (!lv_obj_check_type(c, &lv_label_class)) continue;
+        lv_obj_set_style_text_color(c, on ? kInk : (lv_obj_get_user_data(c) ? kDim : kText), 0);
+    }
+}
+
+void cd_audition_off(lv_timer_t* = nullptr)
+{
+    uint8_t notes[kChordMax];
+    const int n = unpack_chord(s_auditionHeld, notes);
+    s_auditionHeld = 0;
+    if (auto* p = inst()) for (int i = 0; i < n; ++i) p->noteOff(notes[i]);
+    if (n) light_off(s_auditionPad);
+    if (s_cv.audition) lv_timer_pause(s_cv.audition);
+}
+
+/// The selected chord for a moment, as the pads would play it.
+void cd_audition()
+{
+    cd_audition_off();
+    uint8_t notes[kChordMax] = {};
+    const int n = crosspad::chords::notes(s_prog.chords[s_prog.selected], chord_octave(),
+                                          s_prog.voicing, notes);
+    for (int i = 0; i < n; ++i) notes[i] = (uint8_t)clamp_note(notes[i] + s_transpose);
+    s_auditionHeld = pack_chord(notes, n);
+    s_auditionPad = s_prog.selected;
+    for (int i = 0; i < n; ++i) play_one(notes[i], 100, s_auditionPad);
+    light_on(s_auditionPad, 100);
+    if (s_cv.audition) {
+        lv_timer_reset(s_cv.audition);
+        lv_timer_resume(s_cv.audition);
+    }
+}
+
+void cd_show_strip()
+{
+    const auto& p = s_prog;
+    const uint32_t lit = s_lit.load();
+    for (int j = 0; j < kStripSlots; ++j) {
+        lv_obj_t* sl = s_cv.slot[j];
+        if (!sl) continue;
+        const int i = s_cv.page * kStripSlots + j;
+        lv_obj_set_style_border_width(sl, i == p.selected && i < p.count ? 2 : 0, 0);
+        lv_obj_add_flag(s_cv.slotBar[j], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(sl, LV_OBJ_FLAG_CLICKABLE);
+        if (i < p.count) {
+            const bool sounding = (lit & (1u << i)) != 0;
+            lv_obj_set_style_bg_color(sl, sounding ? kPress : kPanel, 0);
+            lv_label_set_text(s_cv.slotR[j], crosspad::chords::noteName(p.chords[i].root));
+            lv_obj_set_style_text_color(s_cv.slotR[j], kText, 0);
+            lv_label_set_text(s_cv.slotQ[j], crosspad::chords::qualityName(p.chords[i].quality));
+            lv_obj_align(s_cv.slotR[j], LV_ALIGN_TOP_MID, 0, 4);
+            if (sounding) lv_obj_remove_flag(s_cv.slotBar[j], LV_OBJ_FLAG_HIDDEN);
         } else {
-            std::snprintf(b, sizeof(b), "-");
+            lv_obj_set_style_bg_color(sl, kWell, 0);
+            lv_label_set_text(s_cv.slotQ[j], "");
+            if (i == p.count && p.count < crosspad::chords::kMaxChords) {
+                lv_label_set_text(s_cv.slotR[j], "+");
+                lv_obj_set_style_text_color(s_cv.slotR[j], kDim, 0);
+                lv_obj_align(s_cv.slotR[j], LV_ALIGN_CENTER, 0, 0);
+            } else {
+                lv_label_set_text(s_cv.slotR[j], "");
+                lv_obj_remove_flag(sl, LV_OBJ_FLAG_CLICKABLE);
+            }
         }
-        lv_label_set_text(lv_obj_get_child(s_progChip[i], 0), b);
     }
-    if (!s_progVal[0]) return;
+    s_cv.drawnLit = lit;
+}
+
+void cd_show()
+{
+    if (!s_cv.preset) return;
+    namespace ch = crosspad::chords;
+    const auto& p = s_prog;
+    const ch::Chord& c = p.chords[p.selected];
     char b[16];
-    std::snprintf(b, sizeof(b), "%d", s_edit.steps[s_editSel].degree + 1);
-    lv_label_set_text(s_progVal[0], b);
-    lv_label_set_text(s_progVal[1], s_mt.chordShortName(s_edit.steps[s_editSel].chordType));
+    const bool presets = !lv_obj_has_flag(s_cv.presets, LV_OBJ_FLAG_HIDDEN);
+
+    prog_label(b, sizeof(b));
+    lv_label_set_text(s_cv.presetL, b);
+    cd_on(s_cv.preset, presets);
+    std::snprintf(b, sizeof(b), "%d", s_oct + 3);   // what the OCT field on the main screen says
+    lv_label_set_text(s_cv.octV, b);
+    lv_label_set_text(s_cv.voiceV, ch::voicingName(p.voicing));
+    lv_label_set_text(s_cv.onV, s_chordsOn ? "ON" : "OFF");
+    cd_on(s_cv.onKey, s_chordsOn);
+
+    const uint8_t lastPage = p.count >= kStripSlots ? 1 : 0;
+    if (s_cv.page > lastPage) s_cv.page = lastPage;
+    cd_show_strip();
+    lv_obj_set_style_text_color(s_cv.page1, s_cv.page ? kDim : kAccent, 0);
+    lv_obj_set_style_text_color(s_cv.page2, s_cv.page ? kAccent : kDim, 0);
+
+    const uint8_t nat = ch::natural(c.root);
+    for (int i = 0; i < 7; ++i) cd_on(s_cv.root[i], kNatural[i] == nat);
+    cd_on(s_cv.sharp, ch::isSharp(c.root));
+    lv_obj_set_style_opa(s_cv.sharp, ch::canSharp(c.root) ? LV_OPA_COVER : LV_OPA_40, 0);
+    for (int i = 0; i < ch::QualityCount; ++i) cd_on(s_cv.type[i], c.quality == i);
+    std::snprintf(b, sizeof(b), "INV %u", (unsigned)c.inversion);
+    lv_label_set_text(s_cv.invL, b);
+
+    for (uint8_t i = 0; i < ch::presetCount(); ++i) cd_on(s_cv.presetKey[i], p.preset == i && !p.edited);
 }
 
-void prog_chip_cb(lv_event_t* e)
+void cd_presets(bool show)
 {
-    const int i = (int)(intptr_t)lv_event_get_user_data(e);
-    if (i < s_edit.count) { s_editSel = i; prog_show(); }
+    lv_obj_set_flag(s_cv.presets, LV_OBJ_FLAG_HIDDEN, !show);
+    lv_obj_set_flag(s_cv.pick, LV_OBJ_FLAG_HIDDEN, show);
 }
 
-/// (which << 1) | up, as in the scale window: 0 the degree, 1 the chord.
-void prog_step_cb(lv_event_t* e)
+/// What the pads play has changed: the map, the cells, the LEDs, the field.
+void cd_apply()
 {
-    const int code = (int)(intptr_t)lv_event_get_user_data(e);
-    const int d = (code & 1) ? 1 : -1;
-    auto& st = s_edit.steps[s_editSel];
-    if ((code >> 1) == 0) {
-        /* Degrees of the scale that is current: a seven-note scale has
-         * seven, a pentatonic five. */
-        const int n = 7;   // MusicTheory wraps a degree into the scale itself
-        st.degree = (uint8_t)((st.degree + n + d) % n);
-    } else {
-        const int n = crosspad::MusicTheory::playableChordCount();
-        st.chordType = (uint8_t)((st.chordType + n + d) % n);
+    s_progDirty = true;
+    rebuild_pads();
+    show_pads();
+    show_leds();
+}
+
+void cd_ev(lv_event_t* e)
+{
+    namespace ch = crosspad::chords;
+    const intptr_t d = (intptr_t)lv_event_get_user_data(e);
+    const int act = (int)(d & 0xFF), i = (int)(d >> 8);
+    auto& p = s_prog;
+    bool hear = false;
+    cd_presets(act == A_PRESET && lv_obj_has_flag(s_cv.presets, LV_OBJ_FLAG_HIDDEN));
+    switch (act) {
+        case A_PRESET: cd_show(); return;
+        case A_LOAD:   ch::loadPreset(p, (uint8_t)i); s_cv.page = 0; hear = true; break;
+        case A_OCT:
+            /* C2 .. C5 for the chords, round again: a tap, not a turn. */
+            set_mapping(s_oct >= 3 ? 0 : s_oct + 1, s_key, s_scale, s_transpose);
+            hear = true;
+            break;
+        case A_VOICE:  ch::cycleVoicing(p); hear = true; break;
+        case A_ON:     s_chordsOn = !s_chordsOn; break;
+        case A_SLOT: {
+            const int idx = s_cv.page * kStripSlots + i;
+            if (idx < p.count) ch::select(p, (uint8_t)idx);
+            else if (!ch::append(p)) return;
+            hear = true;
+            break;
+        }
+        case A_PAGE:
+            s_cv.page ^= 1;
+            if (s_cv.page * kStripSlots < p.count) p.selected = (uint8_t)(s_cv.page * kStripSlots);
+            break;
+        case A_ROOT:   ch::setRoot(p, kNatural[i]); hear = true; break;
+        case A_SHARP:  ch::toggleSharp(p); hear = true; break;
+        case A_TYPE:   ch::setQuality(p, (uint8_t)i); hear = true; break;
+        case A_SK:
+            if (i == 0) { ch::cycleInversion(p); hear = true; }
+            if (i == 1) hear = ch::add(p);
+            if (i == 2) ch::remove(p);
+            if (i == 3) ch::move(p, -1);
+            if (i == 4) ch::move(p, +1);
+            break;
+        default: return;
     }
-    prog_show();
+    if (act != A_PAGE) s_cv.page = (uint8_t)(p.selected / kStripSlots);
+    cd_apply();
+    if (hear) cd_audition();
+    cd_show();
 }
 
-void prog_add_cb(lv_event_t*)
+/// A pad played: its chord is the one being edited.
+void cd_take_pad()
 {
-    if (s_edit.count >= kMaxSteps) return;
-    s_edit.steps[s_edit.count] = s_edit.steps[s_edit.count ? s_edit.count - 1 : 0];
-    s_editSel = s_edit.count;
-    ++s_edit.count;
-    prog_show();
+    const uint8_t picked = s_padPicked.exchange(0);
+    if (!picked || !s_chordsOn || picked - 1 >= s_prog.count || picked - 1 == s_prog.selected) return;
+    crosspad::chords::select(s_prog, (uint8_t)(picked - 1));
+    s_progDirty = true;
+    show_leds();
+    if (s_ov != Overlay::Chord) return;
+    s_cv.page = (uint8_t)(s_prog.selected / kStripSlots);
+    cd_show();
 }
 
-void prog_del_cb(lv_event_t*)
+void cd_close()
 {
-    if (s_edit.count <= 1) return;
-    --s_edit.count;
-    if (s_editSel >= s_edit.count) s_editSel = s_edit.count - 1;
-    prog_show();
+    cd_audition_off();
+    if (s_cv.audition) lv_timer_delete(s_cv.audition);
+    s_cv = ChordView{};
+    save_chords();
 }
 
-void prog_save_cb(lv_event_t*)
+void chord_open()
 {
-    const int slot = s_editSlot >= 0 && s_editSlot < kMaxCustom ? s_editSlot : s_customN;
-    if (slot >= kMaxCustom) { show_info("No room for another progression."); return; }
-    /* (slot & 7) rather than slot + 1: kMaxCustom is 8, and masking is what
-     * lets the compiler see the number is one digit. */
-    std::snprintf(s_edit.name, sizeof(s_edit.name), "Mine %d", (slot & 7) + 1);
-    s_custom[slot] = s_edit;
-    if (slot == s_customN) ++s_customN;
-    register_customs();
-    save_customs();
-    close_overlay();
-    /* Play it at once -- that is what the player came here for. */
-    set_mapping(s_oct, s_key, s_scale, s_transpose, custom_chord_index(slot));
-}
+    namespace ch = crosspad::chords;
+    lv_obj_t* o = open_overlay(Overlay::Chord);
+    lv_obj_set_layout(o, LV_LAYOUT_NONE);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    s_cv = ChordView{};
+    s_cv.page = (uint8_t)(s_prog.selected / kStripSlots);
+    s_cv.audition = lv_timer_create(cd_audition_off, kAuditionMs, nullptr);
+    lv_timer_pause(s_cv.audition);
 
-lv_obj_t* prog_value_row(const char* name, int which)
-{
-    lv_obj_t* r = make_row(s_overlay, kRowH);
-    lv_obj_t* l = lv_label_create(r);
-    lv_obj_set_flex_grow(l, 1);
-    lv_label_set_text(l, name);
-    make_button(r, 30, LV_SYMBOL_MINUS, prog_step_cb, s_overlayGroup, (void*)(intptr_t)(which << 1));
-    lv_obj_t* v = lv_label_create(r);
-    lv_obj_set_width(v, 70);
-    lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(v, kAccent, 0);
-    lv_label_set_text(v, "");
-    s_progVal[which] = v;
-    make_button(r, 30, LV_SYMBOL_PLUS, prog_step_cb, s_overlayGroup, (void*)(intptr_t)((which << 1) | 1));
-    return r;
-}
-
-/// @p slot < 0 starts a new one, otherwise edits that stored progression.
-void prog_open(int slot)
-{
-    s_editSlot = slot;
-    if (slot >= 0 && slot < s_customN) {
-        s_edit = s_custom[slot];
-    } else {
-        /* I - V - vi - IV to start from: the one everybody already knows. */
-        s_edit.count = 4;
-        s_edit.steps[0] = {0, 1};
-        s_edit.steps[1] = {4, 1};
-        s_edit.steps[2] = {5, 2};
-        s_edit.steps[3] = {3, 1};
-    }
-    s_editSel = 0;
-
-    open_overlay(Overlay::Prog);
-    overlay_header(slot >= 0 ? "Edit progression" : "New progression");
-
-    lv_obj_t* chips = make_row(s_overlay, kRowH);
-    lv_obj_set_style_pad_column(chips, 3, 0);
-    for (int i = 0; i < kMaxSteps; ++i) {
-        lv_obj_t* b = make_button(chips, 0, "-", prog_chip_cb, s_overlayGroup, (void*)(intptr_t)i);
-        lv_obj_set_flex_grow(b, 1);
-        s_progChip[i] = b;
+    /* CHORD means a pad plays a chord: opening the designer turns them on. */
+    if (!s_chordsOn) {
+        s_chordsOn = true;
+        cd_apply();
     }
 
-    prog_value_row("Degree", 0);
-    prog_value_row("Chord", 1);
+    // context row
+    s_cv.preset = cd_key(o, 4, 4, 86, 22, A_PRESET, 0);
+    s_cv.presetL = cd_text(s_cv.preset, &lv_font_montserrat_14, kText, "");
+    lv_obj_center(s_cv.presetL);
+    s_cv.octV   = cd_field(94, 48, "OCT", A_OCT);
+    s_cv.voiceV = cd_field(146, 92, "VOICE", A_VOICE);
+    s_cv.onV    = cd_field(242, 74, "CHORD", A_ON, &s_cv.onKey);
 
-    lv_obj_t* tools = make_row(s_overlay, kRowH);
-    make_button(tools, 56, "+ STEP", prog_add_cb, s_overlayGroup);
-    make_button(tools, 56, "- STEP", prog_del_cb, s_overlayGroup);
-    lv_obj_t* gap = lv_obj_create(tools);
-    lv_obj_remove_style_all(gap);
-    lv_obj_set_flex_grow(gap, 1);
-    make_button(tools, 56, "SAVE", prog_save_cb, s_overlayGroup);
+    // strip, roots, types: one box the presets take the place of
+    s_cv.pick = cd_box(o, 0, 28, 320, 146, kBg);
+    lv_obj_set_style_radius(s_cv.pick, 0, 0);
+    for (int j = 0; j < kStripSlots; ++j) {
+        lv_obj_t* sl = cd_key(s_cv.pick, 4 + j * 35, 2, 32, 40, A_SLOT, j);
+        lv_obj_set_style_border_color(sl, kAccent, 0);
+        lv_obj_set_style_clip_corner(sl, true, 0);
+        s_cv.slotR[j] = cd_text(sl, &lv_font_montserrat_16, kText, "");
+        lv_obj_align(s_cv.slotR[j], LV_ALIGN_TOP_MID, 0, 4);
+        s_cv.slotQ[j] = cd_text(sl, &lv_font_montserrat_10, kZone0, "");
+        lv_obj_align(s_cv.slotQ[j], LV_ALIGN_TOP_MID, 0, 24);
+        s_cv.slotBar[j] = cd_box(sl, 0, 0, 32, 3, kMint);
+        lv_obj_set_style_radius(s_cv.slotBar[j], 0, 0);
+        s_cv.slot[j] = sl;
+    }
+    lv_obj_t* pg = cd_key(s_cv.pick, 285, 2, 31, 40, A_PAGE, 0);
+    s_cv.page1 = cd_text(pg, &lv_font_montserrat_14, kAccent, "1");
+    lv_obj_align(s_cv.page1, LV_ALIGN_TOP_MID, 0, 3);
+    s_cv.page2 = cd_text(pg, &lv_font_montserrat_14, kDim, "2");
+    lv_obj_align(s_cv.page2, LV_ALIGN_BOTTOM_MID, 0, -3);
+    for (int i = 0; i < 7; ++i) {
+        s_cv.root[i] = cd_key(s_cv.pick, 4 + i * 39, 46, 36, 30, A_ROOT, i);
+        lv_obj_center(cd_text(s_cv.root[i], &lv_font_montserrat_16, kText, ch::noteName(kNatural[i])));
+    }
+    s_cv.sharp = cd_key(s_cv.pick, 277, 46, 39, 30, A_SHARP, 0);
+    lv_obj_center(cd_text(s_cv.sharp, &lv_font_montserrat_16, kText, "#"));
+    for (int i = 0; i < ch::QualityCount; ++i) {
+        s_cv.type[i] = cd_key(s_cv.pick, 4 + (i % 5) * 63, 80 + (i / 5) * 34, 59, 30, A_TYPE, i);
+        lv_obj_center(cd_text(s_cv.type[i], &lv_font_montserrat_16, kText, ch::qualityName((uint8_t)i)));
+    }
 
-    lv_obj_t* note = lv_label_create(s_overlay);
-    lv_obj_set_width(note, LV_PCT(100));
-    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(note, kDim, 0);
-    lv_obj_set_style_text_font(note, &lv_font_montserrat_10, 0);
-    lv_label_set_text(note,
-        "Steps are degrees of the scale, so the progression follows the key "
-        "and the mode. The pads play it over and over, an octave higher each "
-        "time round.");
-    prog_show();
-}
+    // soft keys
+    static const char* const kSoft[5] = {"INV 0", "ADD", "DEL", "< MOVE", "MOVE >"};
+    for (int i = 0; i < 5; ++i) {
+        lv_obj_t* b = cd_key(o, 4 + i * 63, 176, 59, 30, A_SK, i);
+        lv_obj_t* l = cd_text(b, &lv_font_montserrat_14, kText, kSoft[i]);
+        lv_obj_center(l);
+        if (!i) s_cv.invL = l;
+    }
 
-void prog_new_cb(lv_event_t*)
-{
-    /* Editing the one that is playing, if it is one of ours; otherwise a new
-     * one from I - V - vi - IV. */
-    const int first = custom_chord_index(0);
-    const int slot = (s_chordIdx >= first && s_chordIdx < first + s_customN)
-                   ? s_chordIdx - first : -1;
-    prog_open(slot);
+    // the presets, in the strip's and pickers' place; the soft keys stay
+    s_cv.presets = cd_box(o, 0, 28, 320, 146, kBg);
+    lv_obj_set_style_radius(s_cv.presets, 0, 0);
+    for (uint8_t i = 0; i < ch::presetCount() && i < 16; ++i) {
+        lv_obj_t* b = cd_key(s_cv.presets, 4 + (i % 4) * 79, 2 + (i / 4) * 48, 75, 44, A_LOAD, i);
+        lv_obj_t* n = cd_text(b, &lv_font_montserrat_14, kText, ch::presetName((int8_t)i));
+        lv_obj_align(n, LV_ALIGN_CENTER, 0, -7);
+        char pv[24];
+        ch::presetPreview(i, pv, sizeof(pv));
+        lv_obj_t* v = cd_text(b, &lv_font_montserrat_10, kDim, pv);
+        lv_obj_align(v, LV_ALIGN_CENTER, 0, 9);
+        s_cv.presetKey[i] = b;
+    }
+    cd_presets(false);
+    cd_show();
 }
 
 /* ── the scale, as a shape ─────────────────────────────────────────────────
@@ -2027,19 +2261,11 @@ void seq_cb(lv_event_t*)
 void scale_cb(lv_event_t*)
 {
     open_overlay(Overlay::Scale);
-    overlay_header("Key, scale and chords");
+    overlay_header("Key and scale");
     build_key_strip();
     scale_row("Key", 0);
     scale_row("Scale", 1);
     scale_row("Transpose", 2);
-    scale_row("Chord", 3);
-    /* The way to a progression of one's own; it lands at the end of the Chord
-     * list and starts playing straight away. */
-    lv_obj_t* mine = make_row(s_overlay, kRowH);
-    lv_obj_t* ml = lv_label_create(mine);
-    lv_obj_set_flex_grow(ml, 1);
-    lv_label_set_text(ml, "Own progression");
-    make_button(mine, 86, "EDIT ...", prog_new_cb, s_overlayGroup);
     lv_obj_t* note = lv_label_create(s_overlay);
     lv_obj_set_width(note, LV_PCT(100));
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
@@ -2047,7 +2273,7 @@ void scale_cb(lv_event_t*)
     lv_obj_set_style_text_font(note, &lv_font_montserrat_10, 0);
     lv_label_set_text(note,
         "The pads are sixteen degrees of the scale from the key, shifted by "
-        "the transpose. A chord is built in the scale, so it stays in key.");
+        "the transpose. CHORD puts chords of your own on them instead.");
     show_scale_line();
 }
 
@@ -2059,14 +2285,14 @@ void cell_cb(lv_event_t* e)
     if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
         uint8_t notes[kChordMax] = {};
         const int n = chord_of(pad, notes);
-        s_padHeld[pad] = pack_chord(notes, n);
+        s_padHeld[pad].store(pack_chord(notes, n));
+        if (!n) return;
         for (int i = 0; i < n; ++i) play_one(notes[i], 100, pad);
         light_on(pad, 100);
     } else {
         auto* p = inst();
         uint8_t notes[kChordMax];
-        const int n = unpack_chord(s_padHeld[pad], notes);
-        s_padHeld[pad] = 0;
+        const int n = unpack_chord(s_padHeld[pad].exchange(0), notes);
         for (int i = 0; i < n; ++i) if (p) p->noteOff(notes[i]);
         light_off(pad);
     }
@@ -2075,6 +2301,11 @@ void cell_cb(lv_event_t* e)
 bool back_handler(lv_obj_t*)
 {
     if (s_ov == Overlay::Edit) { edit_done(); return true; }
+    if (s_ov == Overlay::Chord && s_cv.presets && !lv_obj_has_flag(s_cv.presets, LV_OBJ_FLAG_HIDDEN)) {
+        cd_presets(false);
+        cd_show();
+        return true;
+    }
     if (s_ov == Overlay::Browse && s_browseForZone) { open_edit(); return true; }
     if (s_overlay) { close_overlay(); return true; }
     return false;
@@ -2110,7 +2341,7 @@ void take_host()
              * octave the one the grid starts in. */
             const int root = (int)std::lround(s_spec.instrument.zones[0].root);
             const int oct  = std::max(-2, std::min(4, root / 12 - 3));
-            set_mapping(oct, ((root % 12) + 12) % 12, s_scale, s_transpose, s_chordIdx);
+            set_mapping(oct, ((root % 12) + 12) % 12, s_scale, s_transpose);
         }
         s_followRoot = false;
         s_playable.store(state == crosspad::IInstrumentHost::State::Ready);
@@ -2226,6 +2457,8 @@ void tick_cb(lv_timer_t*)
     request_wave();
     show_note();
     show_lit();
+    cd_take_pad();
+    if (s_ov == Overlay::Chord && s_lit.load() != s_cv.drawnLit) cd_show_strip();
 }
 
 } // namespace
@@ -2286,8 +2519,8 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     s_octField   = field(188, 48);
     s_chordField = field(240, 74);
 
-    load_customs();   // and hand them back to MusicTheory
-    if (s_oct == 0 && s_key == 0 && s_scale == 0 && s_chordIdx == 0) s_oct = kOctDefault;
+    load_chords();
+    if (s_oct == 0 && s_key == 0 && s_scale == 0) s_oct = kOctDefault;
     rebuild_pads();
 
     /* ── the pads, bottom left first ─────────────────────────────────────
@@ -2400,8 +2633,11 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     s_noteOnSub = bus.subscribe(crosspad::EventType::NoteOn, midi_note_cb, nullptr);
     s_noteOffSub = bus.subscribe(crosspad::EventType::NoteOff, midi_note_cb, nullptr);
 
-    // What it played last time plays again; nothing yet, the kit's first pad.
-    if (s_haveSpec && !s_spec.instrument.zones.empty()) load_spec();
+    /* One the kit browser picked, or what it played last time again; nothing
+     * yet, the kit's first pad. */
+    std::string asked;
+    if (crosspad::instrumentTakeOpenRequest(asked)) open_instrument(asked);
+    else if (s_haveSpec && !s_spec.instrument.zones.empty()) load_spec();
     else open_kit_sample();
 
     /* The instrument first: the first thing a player reaches for here is
@@ -2442,6 +2678,8 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
 
 void PitchPlay_destroy(lv_obj_t* root)
 {
+    if (s_ov == Overlay::Chord) cd_close();
+    save_chords();
     if (s_timer) {
         lv_timer_delete(s_timer);
         s_timer = nullptr;

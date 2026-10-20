@@ -1,6 +1,6 @@
 {
   "name": "crosspad-pitchplay",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "license": "GPL-3.0-or-later",
   "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
   "keywords": [
@@ -11,8 +11,8 @@
     "sampler"
   ],
   "dependencies": {
-    "crosspad-core": ">=1.70.0,<3.0.0",
-    "crosspad-gui": ">=1.28.0,<3.0.0"
+    "crosspad-core": ">=2.2.0,<3.0.0",
+    "crosspad-gui": ">=2.0.0,<3.0.0"
   },
   "build": {
     "appLibrary": true
