@@ -46,6 +46,8 @@
 #include "crosspad/event/IEventBus.hpp"
 #include "crosspad/instrument/IInstrumentHost.hpp"
 #include "crosspad/instrument/PitchedInstrument.hpp"
+#include "crosspad/kit/IKitManager.hpp"
+#include "crosspad/kit/KitPathUtils.hpp"
 #include "crosspad/music/MusicTheory.hpp"
 #ifdef ESP_PLATFORM
   #include "nvs.h"
@@ -885,13 +887,14 @@ void open_instrument(const std::string& path)
     show_info("Opening ...");
 }
 
-/// One WAV is an instrument of one zone, its pitch detected.
-void open_sample(const std::string& logicalPath)
+/// One WAV is an instrument of one zone, its pitch detected; named after the
+/// file unless @p name says otherwise.
+void open_sample(const std::string& logicalPath, const std::string& name = {})
 {
     s_spec = crosspad::KitInfo();
-    std::string name = base_of(logicalPath);
-    if (name.size() > 4) name.resize(name.size() - 4);
-    s_spec.name = name;
+    std::string file = base_of(logicalPath);
+    if (file.size() > 4) file.resize(file.size() - 4);
+    s_spec.name = name.empty() ? file : name;
     s_spec.engine = crosspad::KitEngine::Pitched;
     crosspad::InstrumentZoneSpec z;
     z.sample = logicalPath;
@@ -2193,6 +2196,28 @@ void take_tools()
     }
 }
 
+/// Nothing to play yet -- no instrument picked, none in the host, not a Pitch
+/// track's screen: the loaded kit's first pad that has a sample, so the keys
+/// sound the moment a new player opens this, and the name button says what
+/// it is and where to change it.
+void open_kit_sample()
+{
+    if (s_haveSpec || pitch_track()) return;
+    auto* h = host();
+    if (!h || h->state() == crosspad::IInstrumentHost::State::Ready) return;
+    if (!crosspad::instrumentPlayState().instrumentPath.empty()) return;
+    crosspad::IKitManager* kits = crosspad::getKitManager();
+    const crosspad::KitInfo* kit = kits ? kits->getCurrentKit() : nullptr;
+    if (!kit) return;
+    for (size_t i = 0; i < KIT_PADS; ++i) {
+        const auto& pad = kit->pads[i];
+        if (pad.samples.empty() || pad.samples[0].sample.empty()) continue;
+        open_sample(crosspad::resolveKitSamplePath(kit->path, pad.samples[0].sample),
+                    kit->name + " pad " + std::to_string(i + 1));
+        return;
+    }
+}
+
 void tick_cb(lv_timer_t*)
 {
     take_host();
@@ -2375,8 +2400,9 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     s_noteOnSub = bus.subscribe(crosspad::EventType::NoteOn, midi_note_cb, nullptr);
     s_noteOffSub = bus.subscribe(crosspad::EventType::NoteOff, midi_note_cb, nullptr);
 
-    // What it played last time plays again.
+    // What it played last time plays again; nothing yet, the kit's first pad.
     if (s_haveSpec && !s_spec.instrument.zones.empty()) load_spec();
+    else open_kit_sample();
 
     /* The instrument first: the first thing a player reaches for here is
      * which sound, and everything else on the screen is set against it. */
