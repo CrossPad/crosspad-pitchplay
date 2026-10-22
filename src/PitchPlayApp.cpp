@@ -538,8 +538,15 @@ class PitchPlayPadLogic : public crosspad::IPadLogicHandler {
 public:
     void onActivate(crosspad::PadManager&) override {}
     void onDeactivate(crosspad::PadManager&) override {}
-    void onPadPress(crosspad::PadManager&, uint8_t pad, uint8_t vel) override
+    void onPadPress(crosspad::PadManager& pm, uint8_t pad, uint8_t vel) override
     {
+        /* The sequencer's presses are the kit's notes (route 0 of a song, the
+         * Drums track): the kit plays them. Played here, a song under this
+         * screen came out as the Drums track's notes on the instrument. */
+        if (pm.pressSource(pad) == crosspad::EventSource::SequencerCallback) {
+            if (auto base = beneath(pm)) base->onPadPress(pm, pad, vel);
+            return;
+        }
         if (pad >= kPads) return;
         /* The chord is kept as it was struck, so a release still stops the
          * right notes after OCT, the key or the chord itself has moved. */
@@ -553,6 +560,10 @@ public:
     }
     void onPadRelease(crosspad::PadManager& pm, uint8_t pad) override
     {
+        if (pm.pressSource(pad) == crosspad::EventSource::SequencerCallback) {
+            if (auto base = beneath(pm)) base->onPadRelease(pm, pad);
+            return;
+        }
         if (pad >= kPads) return;
         auto* p = inst();
         uint8_t notes[kChordMax];
@@ -562,6 +573,13 @@ public:
         pm.notifyNoteOff(pad, true);
     }
     void onPadPressure(crosspad::PadManager&, uint8_t, uint8_t) override {}
+
+private:
+    std::shared_ptr<crosspad::IPadLogicHandler> beneath(crosspad::PadManager& pm) const
+    {
+        auto base = pm.getPadLogic(pm.getBasePadLogic());
+        return base.get() == this ? nullptr : base;
+    }
 };
 std::shared_ptr<PitchPlayPadLogic> s_padLogic;
 
