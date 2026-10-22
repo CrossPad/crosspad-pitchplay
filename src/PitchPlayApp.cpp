@@ -2443,6 +2443,36 @@ void take_tools()
 /// track's screen: the loaded kit's first pad that has a sample, so the keys
 /// sound the moment a new player opens this, and the name button says what
 /// it is and where to change it.
+/// The instrument already up -- a song's, or its Pitch track's in Arrange --
+/// is the one this screen shows and edits. Without it the screen said "Pick
+/// a sample" over the song's instrument, EDIT began a new one, and the last
+/// one shown here was built again in the song's place. One still being built
+/// is taken when the host is through (take_host()).
+bool take_playing()
+{
+    auto* h = host();
+    if (!h) return false;
+    const auto state = h->state();
+    if (state == crosspad::IInstrumentHost::State::Busy) {
+        s_wait = Wait::Load;
+        s_playable.store(false);
+        return true;
+    }
+    if (state != crosspad::IInstrumentHost::State::Ready) return false;
+    const crosspad::KitInfo spec = h->instrument();
+    if (spec.instrument.zones.empty()) return false;
+    s_spec = spec;
+    s_haveSpec = true;
+    s_dirty = false;
+    s_playable.store(true);
+    apply_volume();
+    show_pads();
+    show_leds();
+    show_name();
+    show_env();
+    return true;
+}
+
 void open_kit_sample()
 {
     if (s_haveSpec || pitch_track()) return;
@@ -2649,6 +2679,7 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
      * yet, the kit's first pad. */
     std::string asked;
     if (crosspad::instrumentTakeOpenRequest(asked)) open_instrument(asked);
+    else if (take_playing()) {}
     else if (s_haveSpec && !s_spec.instrument.zones.empty()) load_spec();
     else open_kit_sample();
 
