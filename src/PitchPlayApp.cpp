@@ -178,6 +178,7 @@ uint8_t s_volume = 80;         // every pad's level, 0..100: zones peak at -1 dB
 bool    s_followRoot = false;  // a sample just picked: its root goes to the middle of the pads
 
 bool    s_dirty = false;       // zones edited since the bank was built
+bool    s_saveEdits = false;   // the build under way is of edits: saved to the instrument's file once played
 Wait    s_wait = Wait::None;
 Listing s_listing = Listing::None;
 std::vector<std::string> s_library;   // instrument names
@@ -1580,6 +1581,7 @@ void edit_done()
         return;
     }
     s_haveSpec = true;
+    s_saveEdits = true;
     load_spec();
 }
 
@@ -2325,6 +2327,7 @@ void take_host()
     if (state == crosspad::IInstrumentHost::State::Failed) {
         if (was == Wait::Load) s_playable.store(false);
         s_followRoot = false;
+        s_saveEdits = false;
         show_info(msg.empty() ? "That did not work." : msg.c_str());
         return;
     }
@@ -2359,6 +2362,15 @@ void take_host()
         show_name();
         if (!msg.empty()) show_info(msg.c_str());
         else show_info();
+        /* An instrument with a file of its own keeps its edits there, as a
+         * kit keeps its own: a song names the file, and opening it again
+         * played the instrument as it was before the edit. */
+        const bool keep = s_saveEdits && state == crosspad::IInstrumentHost::State::Ready && !s_spec.path.empty();
+        s_saveEdits = false;
+        if (keep && h->requestSave(s_spec)) {
+            s_wait = Wait::Save;
+            show_info("Saving ...");
+        }
     } else {
         s_dirty = false;
         show_name();
