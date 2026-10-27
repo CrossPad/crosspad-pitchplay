@@ -91,9 +91,14 @@ namespace {
 
 constexpr uint32_t kTickMs   = 50;
 /* A screen y as a y inside the root, which begins under the transport bar.
- * The whole screen is laid out in the design's screen coordinates and this is
- * the only place the shift happens. */
-#define PP_Y(v) ((v) - TRANSPORT_BAR_HEIGHT)
+ * The whole screen is laid out in the design's screen coordinates -- drawn
+ * under a 30 px bar -- and this is the only place the shift happens. Under
+ * the 40 px bar (crosspad-gui 2.4) the root is 200 px, not 210: the design's
+ * 35 (the context row) lands 2 px under the bar and the soft keys move up 2
+ * (PP_Y(204)); subtracting the bar's own height put the context row 5 px
+ * under it. Arrange (kExportTop) does the same. */
+constexpr int32_t kDesignTop = 33;
+#define PP_Y(v) ((v) - kDesignTop)
 constexpr uint8_t  kPads     = 16;
 constexpr int      kChordMax = crosspad::chords::kMaxNotes;   ///< notes in the widest chord a pad makes
 
@@ -2671,7 +2676,7 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
         for (int i = 0; i < 5; ++i) {
             lv_obj_t* b = make_button(s_root, 58, keys[i].text, keys[i].cb, g, keys[i].ud);
             lv_obj_set_height(b, 28);
-            place(b, 6 + i * 62, PP_Y(206));
+            place(b, 6 + i * 62, PP_Y(204));
         }
     }
 
