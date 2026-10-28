@@ -47,6 +47,7 @@
 #include "crosspad/event/EventData.hpp"
 #include "crosspad/event/IEventBus.hpp"
 #include "crosspad/instrument/IInstrumentHost.hpp"
+#include "crosspad/instrument/InstrumentGroups.hpp"
 #include "crosspad/instrument/PitchedInstrument.hpp"
 #include "crosspad/kit/IKitManager.hpp"
 #include "crosspad/kit/KitPathUtils.hpp"
@@ -92,11 +93,11 @@ namespace {
 constexpr uint32_t kTickMs   = 50;
 /* A screen y as a y inside the root, which begins under the transport bar.
  * The whole screen is laid out in the design's screen coordinates -- drawn
- * under a 30 px bar -- and this is the only place the shift happens. Under
- * the 40 px bar (crosspad-gui 2.4) the root is 200 px, not 210: the design's
- * 35 (the context row) lands 2 px under the bar and the soft keys move up 2
- * (PP_Y(204)); subtracting the bar's own height put the context row 5 px
- * under it. Arrange (kExportTop) does the same. */
+ * under a 30 px bar -- and this is the only place the shift happens. Under the
+ * 40 px bar (crosspad-gui 2.4) the root is 200 px, not 210: subtracting the
+ * bar's own height put the context row 5 px under it. From 33 the row is 2 px
+ * below the bar and the soft keys move up 2 (PP_Y(204)) to end inside the
+ * screen, as Arrange's do (kExportTop). */
 constexpr int32_t kDesignTop = 33;
 #define PP_Y(v) ((v) - kDesignTop)
 constexpr uint8_t  kPads     = 16;
@@ -139,11 +140,11 @@ constexpr size_t kZoneColors = sizeof(kZoneRgb) / sizeof(kZoneRgb[0]);
 enum class Wait : uint8_t { None, Load, Save };
 enum class Listing : uint8_t { None, Library, Takes };
 enum class Overlay : uint8_t { None, Edit, Browse, Name, Scale, Chord, Sample };
-enum class EntryKind : uint8_t { Instrument, Sample, Card };
+enum class EntryKind : uint8_t { Instrument, Group, Sample, Card };
 
 struct Entry {
     EntryKind   kind;
-    std::string path;   ///< logical: an instrument file or a WAV
+    std::string path;   ///< logical: an instrument file or a WAV; a group's name
 };
 
 lv_obj_t* s_root = nullptr;
@@ -196,6 +197,9 @@ std::vector<std::string> s_labels;    // and how each of them reads
  * selector is a virtual list for. Measured: 404 kB free before the window,
  * 204 kB with it open. */
 uint32_t s_samplePage = 0;
+/* The group of instruments the window shows, "" for the list of groups. Kept
+ * when the window closes: the next sound tried is most often of the same kind. */
+PP_SLOW_BSS char s_sampleGroup[24];
 char    s_ddText[48] = "Pick a sample";
 bool    s_fillPending = false;        // a listing came in while the sample window is open
 
@@ -362,10 +366,14 @@ void prog_label(char* buf, size_t n)
  * if they read this instead of keeping a copy of the key, the scale and the
  * chords. Published from the two places the state can change -- the map here,
  * the instrument when a load lands. */
+PP_SLOW_BSS uint32_t s_pubGen;  ///< the shared state's generation as this app last left it
+
 void publish_play_state()
 {
     auto& st = crosspad::instrumentPlayState();
     st.play = s_ps;                  // rebuildPadMap() and the chords are already on it
+    st.transpose = (int8_t)s_transpose;
+    st.chordsOn = s_chordsOn;
     if (s_chordsOn) {
         char b[16];
         prog_label(b, sizeof(b));
@@ -375,6 +383,7 @@ void publish_play_state()
         st.chordName = cn ? cn : "";
     }
     crosspad::instrumentPlayStatePublished();
+    s_pubGen = st.generation;
 }
 
 /// The list onto the pads: chord n's notes on pad n, the rest silent.
@@ -978,18 +987,42 @@ void request_listing()
 
 void open_sample_window();
 
-/// What the sample window offers, in its order: the saved instruments, the
-/// Recorder's takes, and the card for any WAV.
+/// What the sample window offers, in its order: the saved instruments by
+/// group -- the groups, or the one open, its instruments --, the Recorder's
+/// takes, and the card for any WAV.
 void fill_dropdown()
 {
     s_entries.clear();
     s_labels.clear();
     auto* h = host();
     if (!h) return;
+    if (s_sampleGroup[0]) {
+        std::vector<std::string> names;
+        for (const auto& n : s_library)
+            if (crosspad::InstrumentGroups::group(n) == s_sampleGroup) names.push_back(n);
+        std::sort(names.begin(), names.end());
+        for (const auto& n : names) {
+            s_entries.push_back({EntryKind::Instrument,
+                                 h->libraryRoot() + "/" + n + "/" + crosspad::IInstrumentHost::kFileName});
+            s_labels.push_back(std::string(LV_SYMBOL_KEYBOARD " ") + crosspad::InstrumentGroups::shortName(n));
+        }
+        show_name();
+        if (s_ov == Overlay::Sample) { s_fillPending = false; open_sample_window(); }
+        return;
+    }
+    std::vector<std::pair<std::string, unsigned>> groups;
     for (const auto& n : s_library) {
-        s_entries.push_back({EntryKind::Instrument,
-                             h->libraryRoot() + "/" + n + "/" + crosspad::IInstrumentHost::kFileName});
-        s_labels.push_back(std::string(LV_SYMBOL_KEYBOARD " ") + n);
+        const std::string g = crosspad::InstrumentGroups::group(n);
+        auto it = std::find_if(groups.begin(), groups.end(), [&](const auto& e) { return e.first == g; });
+        if (it == groups.end()) groups.push_back({g, 1});
+        else                    ++it->second;
+    }
+    std::sort(groups.begin(), groups.end());
+    for (const auto& g : groups) {
+        s_entries.push_back({EntryKind::Group, g.first});
+        char label[48];
+        std::snprintf(label, sizeof(label), LV_SYMBOL_DIRECTORY " %s  (%u)", g.first.c_str(), g.second);
+        s_labels.push_back(label);
     }
     for (const auto& t : s_takes) {
         s_entries.push_back({EntryKind::Sample, t});
@@ -1014,10 +1047,17 @@ void sample_pick_cb(lv_event_t* e)
     if (i == SIZE_MAX - 1) { s_samplePage += kPageRows; open_sample_window(); return; }
     if (i >= s_entries.size()) return;
     const Entry entry = s_entries[i];
+    if (entry.kind == EntryKind::Group) {
+        std::snprintf(s_sampleGroup, sizeof(s_sampleGroup), "%s", entry.path.c_str());
+        s_samplePage = 0;
+        fill_dropdown();          // the window is open: it shows the group
+        return;
+    }
     close_overlay();
     switch (entry.kind) {
     case EntryKind::Instrument: open_instrument(entry.path); break;
     case EntryKind::Sample:     open_sample(entry.path); break;
+    case EntryKind::Group:      break;
     case EntryKind::Card:       open_browser(false); break;
     }
 }
@@ -1681,7 +1721,9 @@ void save_cb(lv_event_t*)
 void open_sample_window()
 {
     open_overlay(Overlay::Sample);
-    overlay_header("Sample");
+    char title[40];
+    std::snprintf(title, sizeof(title), s_sampleGroup[0] ? "Sample  " LV_SYMBOL_RIGHT "  %s" : "Sample", s_sampleGroup);
+    overlay_header(title);
     lv_obj_t* col = scroll_column(s_overlay);
     if (s_entries.empty()) {
         lv_obj_t* l = lv_label_create(col);
@@ -2332,6 +2374,12 @@ bool back_handler(lv_obj_t*)
         return true;
     }
     if (s_ov == Overlay::Browse && s_browseForZone) { open_edit(); return true; }
+    if (s_ov == Overlay::Sample && s_sampleGroup[0]) {   // out of the group, to the groups
+        s_sampleGroup[0] = 0;
+        s_samplePage = 0;
+        fill_dropdown();
+        return true;
+    }
     if (s_overlay) { close_overlay(); return true; }
     return false;
 }
@@ -2558,8 +2606,13 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     lv_obj_set_height(s_nameBtn, 22);
     place(s_nameBtn, 6, PP_Y(35));
     lv_obj_set_style_text_color(lv_obj_get_child(s_nameBtn, 0), kZone0, 0);
-    lv_label_set_long_mode(lv_obj_get_child(s_nameBtn, 0), LV_LABEL_LONG_DOT);
-    lv_obj_set_width(lv_obj_get_child(s_nameBtn, 0), 106);
+    {
+        /* One line, cut with dots: a label as tall as its text wraps a long
+         * name ("GUITAR Slap Low") onto a second line out of the button. */
+        lv_obj_t* l = lv_obj_get_child(s_nameBtn, 0);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_size(l, 106, lv_font_get_line_height(lv_obj_get_style_text_font(l, LV_PART_MAIN)));
+    }
 
     auto field = [&](int32_t x, int32_t w) {
         lv_obj_t* f = lv_obj_create(s_root);
@@ -2585,7 +2638,22 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     s_chordField = field(240, 74);
 
     load_chords();
-    if (s_oct == 0 && s_key == 0 && s_scale == 0) s_oct = kOctDefault;
+    /* A map someone else published since -- the open song's, which keeps the
+     * key, scale, octave and transpose its Pitch track was played in -- is
+     * the one the pads take up. */
+    bool adopted = false;
+    {
+        const auto& st = crosspad::instrumentPlayState();
+        if (st.generation != 0 && st.generation != s_pubGen && st.play.padMidiMap[kPads - 1] != 0) {
+            adopted = true;
+            s_key = st.play.rootNote % 12;
+            s_oct = std::clamp<int>(st.play.octave, -2, 4);
+            s_scale = st.play.scaleIndex < crosspad::MusicTheory::scaleCount() ? st.play.scaleIndex : 0;
+            s_transpose = std::clamp<int>(st.transpose, -12, 12);
+            s_chordsOn = st.chordsOn;
+        }
+    }
+    if (!adopted && s_oct == 0 && s_key == 0 && s_scale == 0) s_oct = kOctDefault;
     rebuild_pads();
 
     /* ── the pads, bottom left first ─────────────────────────────────────
