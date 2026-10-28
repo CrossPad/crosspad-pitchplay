@@ -366,10 +366,14 @@ void prog_label(char* buf, size_t n)
  * if they read this instead of keeping a copy of the key, the scale and the
  * chords. Published from the two places the state can change -- the map here,
  * the instrument when a load lands. */
+PP_SLOW_BSS uint32_t s_pubGen;  ///< the shared state's generation as this app last left it
+
 void publish_play_state()
 {
     auto& st = crosspad::instrumentPlayState();
     st.play = s_ps;                  // rebuildPadMap() and the chords are already on it
+    st.transpose = (int8_t)s_transpose;
+    st.chordsOn = s_chordsOn;
     if (s_chordsOn) {
         char b[16];
         prog_label(b, sizeof(b));
@@ -379,6 +383,7 @@ void publish_play_state()
         st.chordName = cn ? cn : "";
     }
     crosspad::instrumentPlayStatePublished();
+    s_pubGen = st.generation;
 }
 
 /// The list onto the pads: chord n's notes on pad n, the rest silent.
@@ -2633,7 +2638,22 @@ lv_obj_t* PitchPlay_create(lv_obj_t* parent, App* app)
     s_chordField = field(240, 74);
 
     load_chords();
-    if (s_oct == 0 && s_key == 0 && s_scale == 0) s_oct = kOctDefault;
+    /* A map someone else published since -- the open song's, which keeps the
+     * key, scale, octave and transpose its Pitch track was played in -- is
+     * the one the pads take up. */
+    bool adopted = false;
+    {
+        const auto& st = crosspad::instrumentPlayState();
+        if (st.generation != 0 && st.generation != s_pubGen && st.play.padMidiMap[kPads - 1] != 0) {
+            adopted = true;
+            s_key = st.play.rootNote % 12;
+            s_oct = std::clamp<int>(st.play.octave, -2, 4);
+            s_scale = st.play.scaleIndex < crosspad::MusicTheory::scaleCount() ? st.play.scaleIndex : 0;
+            s_transpose = std::clamp<int>(st.transpose, -12, 12);
+            s_chordsOn = st.chordsOn;
+        }
+    }
+    if (!adopted && s_oct == 0 && s_key == 0 && s_scale == 0) s_oct = kOctDefault;
     rebuild_pads();
 
     /* ── the pads, bottom left first ─────────────────────────────────────
