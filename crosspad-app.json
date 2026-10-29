@@ -1,7 +1,7 @@
 {
   "name": "Pitch Play",
   "id": "pitchplay",
-  "version": "0.11.0",
+  "version": "0.13.0",
   "description": "One sample or many, played chromatically on the pads and from a MIDI keyboard",
   "category": "music",
   "icon": "pitchplay.png",
@@ -14,6 +14,7 @@
     "crosspad-gui": ">=2.0.0,<3.0.0"
   },
   "changelog": [
+    "0.13.0: 0.11.0's groups of instruments together with 0.12.0, which takes up the open song's pad map.",
     "0.11.0: the sample window lists the saved instruments by group (core InstrumentGroups: 808, BASS, PAD ...) with their counts; a group lists its own by name and back leaves it. A long instrument name stays on one line.",
     "0.10.4: fits under the 40 px top bar (crosspad-gui 2.4): the context row -- the instrument, SCALE, OCT, CHORD -- sat 5 px under it, because the screen is laid out from the design's 30 px bar and shifted by the bar's own height. The context row is 2 px under the bar and the soft keys 2 px higher, as in Arrange 0.19.1.",
     "0.10.3: the sequencer's presses are the kit's notes and the kit plays them -- a song playing under this screen came out as its Drums track's notes on the instrument.",
