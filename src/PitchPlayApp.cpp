@@ -184,6 +184,14 @@ uint8_t s_volume = 80;         // every pad's level, 0..100: zones peak at -1 dB
 bool    s_followRoot = false;  // a sample just picked: its root goes to the middle of the pads
 
 bool    s_dirty = false;       // zones edited since the bank was built
+/* A zone's root, loop, start and crossfade reach the bank that is playing
+ * once the knob has rested kLiveMs (PitchedInstrument::editZone() silences
+ * the zone's notes, so not on every detent); zones added or removed wait for
+ * the rebuild when EDIT closes -- a removal renumbers them. */
+bool     s_liveWanted = false;
+uint32_t s_liveAt = 0;
+bool     s_zonesMoved = false;
+constexpr uint32_t kLiveMs = 150;
 bool    s_saveEdits = false;   // the build under way is of edits: saved to the instrument's file once played
 Wait    s_wait = Wait::None;
 Listing s_listing = Listing::None;
@@ -214,6 +222,16 @@ std::atomic<uint8_t> s_lastVel{0};
 crosspad::WaveOverview s_wave;
 bool        s_wavePending = false;
 std::string s_waveWant;               ///< the file the pending request is for
+/// EDIT's picture zoomed in round a point being turned FINE: [s_viewA,
+/// s_viewB) of the zone, 0..0 for all of it. s_waveAsk* is the range the
+/// pending request is for, s_waveHas* the one s_wave holds.
+uint32_t    s_viewA = 0, s_viewB = 0;
+uint32_t    s_waveAskA = 0, s_waveAskB = 0, s_waveHasA = 0, s_waveHasB = 0;
+/// The frame field being turned (EditField), -1 for none, and whether FINE.
+int         s_turnField = -1;
+int         s_fineField = -1;
+/// Each side of the point while FINE, ~0.25 s.
+constexpr uint32_t kZoomFrames = 12000;
 
 Overlay s_ov = Overlay::None;
 bool    s_browseForZone = false;       // the card's WAV becomes a zone, not an instrument
@@ -879,17 +897,20 @@ void request_wave()
     auto* st = tools();
     if (!st || s_wavePending || s_folderPending || s_listing != Listing::None) return;
     const std::string f = wave_file();
-    if (f.empty() || f == s_wave.file) return;
-    if (!st->requestOverview(f, 0, 0, 150)) return;
+    if (f.empty() || (f == s_wave.file && s_viewA == s_waveHasA && s_viewB == s_waveHasB)) return;
+    if (!st->requestOverview(f, s_viewA, s_viewB, 150)) return;
     s_wavePending = true;
     s_waveWant = f;
+    s_waveAskA = s_viewA;
+    s_waveAskB = s_viewB;
 }
 
 /// The zone, drawn as the min/max columns the tools read, in the colour of
 /// the zone it is -- the same colour the pads it plays are underlined in.
 /// Frames [litFrom, litTo) of @p total are in that colour and the rest dim;
 /// litFrom == litTo lights all of it.
-void draw_wave(lv_layer_t* layer, const lv_area_t& a, uint32_t total, uint32_t litFrom, uint32_t litTo)
+void draw_wave(lv_layer_t* layer, const lv_area_t& a, uint32_t viewA, uint32_t viewLen, uint32_t litFrom,
+               uint32_t litTo)
 {
     if (s_wave.hi.empty() || s_wave.hi.size() != s_wave.lo.size()) return;
     const int32_t w = a.x2 - a.x1 + 1, h = a.y2 - a.y1 + 1;
@@ -905,7 +926,7 @@ void draw_wave(lv_layer_t* layer, const lv_area_t& a, uint32_t total, uint32_t l
     for (int32_t x = 0; x < w; ++x) {
         const size_t i = (size_t)((uint64_t)x * cols / (uint64_t)w);
         if (i >= cols) break;
-        const uint32_t f = total ? (uint32_t)((uint64_t)x * total / (uint64_t)w) : 0;
+        const uint32_t f = viewA + (viewLen ? (uint32_t)((uint64_t)x * viewLen / (uint64_t)w) : 0);
         d.color = (litFrom == litTo || (f >= litFrom && f < litTo)) ? lit : kDim;
         int32_t hi = (int32_t)s_wave.hi[i] * half / 127;
         int32_t lo = (int32_t)s_wave.lo[i] * half / 127;
@@ -920,7 +941,7 @@ void wave_draw_cb(lv_event_t* e)
 {
     lv_area_t a;
     lv_obj_get_coords(lv_event_get_target_obj(e), &a);
-    draw_wave(lv_event_get_layer(e), a, 0, 0, 0);
+    draw_wave(lv_event_get_layer(e), a, 0, 0, 0, 0);
 }
 
 // ── the engine ─────────────────────────────────────────────────────────────
@@ -1304,6 +1325,30 @@ void show_zones()
     show_loop();
 }
 
+void zone_edited()
+{
+    s_liveWanted = true;
+    s_liveAt = lv_tick_get();
+}
+
+/// The selected zone's root, loop, start and crossfade into the bank that is
+/// playing, as the sampler's pitched editor does it. A zone the bank does not
+/// have yet (added in EDIT) is left to the rebuild.
+void apply_zone_live()
+{
+    s_liveWanted = false;
+    auto* in = inst();
+    auto* bank = in ? in->bank() : nullptr;
+    const auto& zones = s_spec.instrument.zones;
+    if (!bank || s_zonesMoved || s_zoneSel < 0 || s_zoneSel >= (int)zones.size() ||
+        s_zoneSel >= bank->zoneCount()) {
+        return;
+    }
+    const auto& z = zones[s_zoneSel];
+    const float root = z.root < 0.0f ? bank->zone((uint8_t)s_zoneSel).rootMidi : z.root;
+    in->editZone((uint8_t)s_zoneSel, root, z.loopStart, z.loopEnd, 10, nullptr, z.loopXfade, z.start);
+}
+
 void root_by(int step)
 {
     auto& zones = s_spec.instrument.zones;
@@ -1312,6 +1357,7 @@ void root_by(int step)
     const int r = z.root < 0 ? 60 : (int)std::lround(z.root);
     z.root = (float)std::max(0, std::min(127, r + step));
     s_dirty = true;
+    zone_edited();
     show_zone_root();
 }
 
@@ -1368,8 +1414,13 @@ void loop_wave_draw_cb(lv_event_t* e)
     lv_obj_get_coords(lv_event_get_target_obj(e), &a);
     const int32_t w = a.x2 - a.x1 + 1;
     if (w <= 2) return;
+    /* All of the zone, or -- turned FINE -- the stretch round the point. */
+    const bool zoomed = s_wave.file == wave_file() && s_waveHasB > s_waveHasA;
+    const uint32_t viewA = zoomed ? s_waveHasA : 0;
+    const uint32_t viewLen = zoomed ? s_waveHasB - s_waveHasA : total;
     auto xOf = [&](uint32_t f) {
-        return a.x1 + (int32_t)((uint64_t)std::min(f, total) * (uint64_t)(w - 1) / total);
+        f = f < viewA ? 0 : std::min(f - viewA, viewLen);
+        return a.x1 + (int32_t)((uint64_t)f * (uint64_t)(w - 1) / viewLen);
     };
 
     const bool looping = z.loopEnd > z.loopStart;
@@ -1390,7 +1441,7 @@ void loop_wave_draw_cb(lv_event_t* e)
         }
     }
     if (s_wave.file == wave_file()) {
-        draw_wave(layer, a, total, looping ? z.loopStart : 0, looping ? z.loopEnd : 0);
+        draw_wave(layer, a, viewA, viewLen, looping ? z.loopStart : 0, looping ? z.loopEnd : 0);
     }
     d.color = kHead;
     d.opa = LV_OPA_COVER;
@@ -1448,6 +1499,11 @@ void show_loop()
 /// length; a zone whose length is unknown steps by a flat 1000 frames.
 uint32_t loop_step()
 {
+    /* FINE: a millisecond. */
+    if (s_fineField >= 0) {
+        const uint32_t rate = zone_audio().sampleRate ? zone_audio().sampleRate : s_wave.sampleRate;
+        return std::max<uint32_t>(1, (rate ? rate : 44100) / 1000);
+    }
     const uint32_t len = zone_frames();
     return len ? std::max<uint32_t>(1, len / 200) : 1000u;
 }
@@ -1469,7 +1525,7 @@ void loop_by(int which, int dir)
         /* From a one-shot, the first + opens a loop over the whole sample
          * rather than a zero-length one at the start, which would be silent. */
         int64_t cur = z.loopEnd ? (int64_t)z.loopEnd : (len ? (int64_t)len : 0);
-        if (!z.loopEnd && dir > 0) { z.loopEnd = (uint32_t)cur; s_dirty = true; show_loop(); return; }
+        if (!z.loopEnd && dir > 0) { z.loopEnd = (uint32_t)cur; s_dirty = true; zone_edited(); show_loop(); return; }
         int64_t v = cur + step;
         const int64_t lo = (int64_t)z.loopStart + 1;
         const int64_t hi = len ? (int64_t)len : v;
@@ -1477,6 +1533,7 @@ void loop_by(int which, int dir)
         z.loopEnd = (uint32_t)v;
     }
     s_dirty = true;
+    zone_edited();
     show_loop();
 }
 
@@ -1498,6 +1555,7 @@ void loop_toggle_cb(lv_event_t*)
         z.loopXfade = (z.loopEnd - z.loopStart) / 4;
     }
     s_dirty = true;
+    zone_edited();
     show_loop();
 }
 
@@ -1514,6 +1572,7 @@ void start_by(int dir)
                                                : (len ? (int64_t)len - 1 : v);
     z.start = (uint32_t)std::max<int64_t>(0, std::min(hi, v));
     s_dirty = true;
+    zone_edited();
     show_loop();
 }
 
@@ -1530,6 +1589,7 @@ void xf_by(int dir)
     const int64_t cur = std::min<uint32_t>(z.loopXfade, most);
     z.loopXfade = (uint32_t)std::max<int64_t>(0, std::min<int64_t>(most, cur + step * dir));
     s_dirty = true;
+    zone_edited();
     show_loop();
 }
 
@@ -1543,11 +1603,81 @@ enum EditField : int { kFieldRoot, kFieldLoopStart, kFieldLoopEnd, kFieldStart, 
  * knob turns fast. A semitone stays a semitone. */
 crosspad::EncoderAccelerator s_editAccel;
 
+/// The frame a frame field stands for: the loop's ends (a one-shot's end is
+/// the zone's), or where a note begins.
+uint32_t field_point(int which)
+{
+    const auto& zones = s_spec.instrument.zones;
+    if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return 0;
+    const auto& z = zones[s_zoneSel];
+    if (which == kFieldLoopStart) return z.loopStart;
+    if (which == kFieldLoopEnd) return z.loopEnd ? z.loopEnd : zone_frames();
+    return z.start;
+}
+
+/// The picture round @p at, or -- moved within a quarter of its edge -- moved
+/// with it.
+void zoom_on(uint32_t at, bool follow = false)
+{
+    const uint32_t len = zone_frames();
+    if (!len) return;
+    if (follow && s_viewB > s_viewA && at >= s_viewA + kZoomFrames / 4 && at + kZoomFrames / 4 <= s_viewB) return;
+    s_viewA = at > kZoomFrames ? at - kZoomFrames : 0;
+    s_viewB = std::min(len, at + kZoomFrames);
+}
+
+void zoom_off()
+{
+    s_fineField = -1;
+    s_turnField = -1;
+    s_viewA = s_viewB = 0;
+    if (s_loopWave) lv_obj_invalidate(s_loopWave);
+}
+
+bool is_frame_field(int which)
+{
+    return which == kFieldLoopStart || which == kFieldLoopEnd || which == kFieldStart;
+}
+
+/// The frame fields click through three states, as the pad editor's markers
+/// do: turned a step of the sample at a time, then FINE -- a millisecond,
+/// the picture zoomed in round the point -- then done.
 void edit_field_cb(lv_event_t* e)
 {
+    const int which = (int)(intptr_t)lv_event_get_user_data(e);
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (is_frame_field(which) && (code == LV_EVENT_CLICKED || code == LV_EVENT_FOCUSED)) {
+        /* Its own state, as the pad editor's markers keep theirs: LVGL turns
+         * the group's editing by itself on the way to these events. */
+        lv_obj_t* b = static_cast<lv_obj_t*>(lv_event_get_current_target(e));
+        lv_group_t* g = b ? lv_obj_get_group(b) : nullptr;
+        if (code == LV_EVENT_FOCUSED) {
+            /* The encoder's first click: LVGL says so with FOCUSED. A finger's
+             * press focuses the field first, which ends editing on the way;
+             * its CLICKED comes next and decides. */
+            lv_indev_t* in = lv_indev_active();
+            if (in && lv_indev_get_type(in) == LV_INDEV_TYPE_POINTER) return;
+            const bool editing = g && lv_group_get_editing(g);
+            if (editing && s_turnField != which) { zoom_off(); s_turnField = which; }
+            else if (!editing && s_turnField == which) zoom_off();
+            return;
+        }
+        if (s_turnField == which && s_fineField == which) {
+            zoom_off();
+            if (g) lv_group_set_editing(g, false);
+        } else if (s_turnField == which) {
+            s_fineField = which;
+            zoom_on(field_point(which));
+            if (g) lv_group_set_editing(g, true);
+        } else {
+            zoom_off();
+            s_turnField = which;
+            if (g) { lv_group_focus_obj(b); lv_group_set_editing(g, true); }
+        }
+        return;
+    }
     int step = number_step(e);
     if (!step) return;
-    const int which = (int)(intptr_t)lv_event_get_user_data(e);
     if (which != kFieldRoot) step *= s_editAccel.update(1, lv_tick_get());
     switch (which) {
         case kFieldRoot:      root_by(step);     break;
@@ -1557,6 +1687,22 @@ void edit_field_cb(lv_event_t* e)
         case kFieldXfade:     xf_by(step);       break;
         default: break;
     }
+    if (s_fineField == which) zoom_on(field_point(which), true);
+}
+
+/// FINE ends with the turning however that ends -- the power button, another
+/// field picked, the window closed -- and the picture shows all of the zone.
+void zoom_check()
+{
+    if (s_turnField < 0) return;
+    lv_obj_t* label = s_turnField == kFieldLoopStart ? s_loopLabel
+                    : s_turnField == kFieldLoopEnd   ? s_loopEndLabel : s_startLabel;
+    lv_obj_t* b = label ? lv_obj_get_parent(label) : nullptr;
+    /* A finger on it ends editing for the length of the press (LVGL focuses
+     * it first); the click that follows decides. */
+    if (b && lv_obj_has_state(b, LV_STATE_PRESSED)) return;
+    lv_group_t* g = b ? lv_obj_get_group(b) : nullptr;
+    if (!g || !lv_group_get_editing(g) || lv_group_get_focused(g) != b) zoom_off();
 }
 
 /// A turned field in @p row; @p w 0 shares the row's free width. Returns the
@@ -1568,6 +1714,7 @@ lv_obj_t* edit_field(lv_obj_t* row, int32_t w, int which)
     if (!w) lv_obj_set_flex_grow(b, 1);
     lv_obj_add_event_cb(b, edit_field_cb, LV_EVENT_KEY, (void*)(intptr_t)which);
     lv_obj_add_event_cb(b, edit_field_cb, LV_EVENT_CLICKED, (void*)(intptr_t)which);
+    lv_obj_add_event_cb(b, edit_field_cb, LV_EVENT_FOCUSED, (void*)(intptr_t)which);
     if (s_overlayGroup) lv_group_add_obj(s_overlayGroup, b);
     return add_label(b, "--");
 }
@@ -1588,12 +1735,14 @@ void open_edit()
         if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
         zones[s_zoneSel].root = -1.0f;
         s_dirty = true;
+        zone_edited();
         show_zone_root();
     }, s_overlayGroup);
     make_button(tools, 48, "DEL", [](lv_event_t*) {
         auto& zones = s_spec.instrument.zones;
         if (s_zoneSel < 0 || s_zoneSel >= (int)zones.size()) return;
         zones.erase(zones.begin() + s_zoneSel);
+        s_zonesMoved = true;
         s_zoneSel = std::min<int>(s_zoneSel, (int)zones.size() - 1);
         s_dirty = true;
         show_zones();
@@ -2406,6 +2555,7 @@ void take_host()
     s_haveSpec = true;
     if (was == Wait::Load) {
         s_dirty = false;
+        s_zonesMoved = false;
         /* One sample: pad 8 plays it as recorded, the pads around it a few
          * semitones either way -- a drum loop detected at F#6 otherwise
          * played three octaves down, a murmur. */
@@ -2444,6 +2594,7 @@ void take_host()
         }
     } else {
         s_dirty = false;
+        s_zonesMoved = false;
         show_name();
         char buf[80];
         std::snprintf(buf, sizeof(buf), "Saved as %s", s_spec.name.c_str());
@@ -2466,11 +2617,15 @@ void take_tools()
              * kept, so a listing that overtook this request cannot leave the
              * box drawing somebody else's sample. */
             if (s_wave.file != s_waveWant) s_wave = crosspad::WaveOverview{};
+            s_waveHasA = s_waveAskA;
+            s_waveHasB = s_waveAskB;
         } else {
             /* Kept as asked: forgotten, a file that cannot be read was asked
              * for again every tick, and the tools did nothing else. */
             s_wave = crosspad::WaveOverview{};
             s_wave.file = s_waveWant;
+            s_waveHasA = s_waveAskA;
+            s_waveHasB = s_waveAskB;
         }
         if (s_waveBox) lv_obj_invalidate(s_waveBox);
         if (s_loopWave) lv_obj_invalidate(s_loopWave);
@@ -2535,6 +2690,7 @@ bool take_playing()
     s_spec = spec;
     s_haveSpec = true;
     s_dirty = false;
+    s_zonesMoved = false;
     s_playable.store(true);
     apply_volume();
     show_pads();
@@ -2566,6 +2722,8 @@ void tick_cb(lv_timer_t*)
 {
     take_host();
     take_tools();
+    zoom_check();
+    if (s_liveWanted && lv_tick_elaps(s_liveAt) >= kLiveMs) apply_zone_live();
     if (s_fillPending) fill_dropdown();
     request_wave();
     show_note();
@@ -2836,6 +2994,13 @@ void PitchPlay_destroy(lv_obj_t* root)
 
     s_overlay = s_zoneList = s_rootLabel = s_nameArea = nullptr;
     s_ov = Overlay::None;
+    /* EDIT's widgets go with the root even when it was open: left set, the
+     * next start's first picture invalidated a deleted s_loopWave. */
+    s_loopLabel = s_loopEndLabel = s_loopWave = s_loopBtn = s_startLabel = s_xfLabel = nullptr;
+    for (auto& c : s_keyCell) c = nullptr;
+    s_turnField = s_fineField = -1;
+    s_viewA = s_viewB = s_waveHasA = s_waveHasB = 0;
+    s_liveWanted = s_zonesMoved = false;
 #ifdef ROM_USE_ENCODER
     if (s_overlayGroup) { lv_group_delete(s_overlayGroup); s_overlayGroup = nullptr; }
     if (indev_encoderTop && s_prevEncGroup) lv_indev_restore_group(indev_encoderTop, s_prevEncGroup);
